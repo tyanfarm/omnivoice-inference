@@ -191,11 +191,32 @@ class OmniVoiceStreamingService:
         return ref_audio_path
 
     @staticmethod
-    def _audio_tensor_to_int16_bytes(audio: torch.Tensor) -> bytes:
-        if audio.dim() == 2:
-            audio = audio.mean(dim=0) if audio.size(0) > 1 else audio.squeeze(0)
+    def _audio_to_numpy(audio: torch.Tensor | np.ndarray) -> np.ndarray:
+        if isinstance(audio, torch.Tensor):
+            if audio.dim() == 2:
+                audio = audio.mean(dim=0) if audio.size(0) > 1 else audio.squeeze(0)
+            return audio.detach().cpu().numpy()
 
-        chunk_np = audio.detach().cpu().numpy()
+        chunk_np = np.asarray(audio)
+        if chunk_np.ndim == 2:
+            chunk_np = (
+                chunk_np.mean(axis=0)
+                if chunk_np.shape[0] > 1
+                else np.squeeze(chunk_np, axis=0)
+            )
+        return chunk_np
+
+    @staticmethod
+    def _audio_chunk_is_empty(audio: torch.Tensor | np.ndarray | None) -> bool:
+        if audio is None:
+            return True
+        if isinstance(audio, torch.Tensor):
+            return audio.numel() == 0
+        return np.asarray(audio).size == 0
+
+    @classmethod
+    def _audio_tensor_to_int16_bytes(cls, audio: torch.Tensor | np.ndarray) -> bytes:
+        chunk_np = cls._audio_to_numpy(audio)
         audio_int16 = (np.clip(chunk_np, -1.0, 1.0) * 32767).astype(np.int16)
         return audio_int16.tobytes()
 
@@ -256,7 +277,7 @@ class OmniVoiceStreamingService:
                     generation_kwargs["instruct"] = request.instruct
 
                 audio_chunk = model.generate(**generation_kwargs)[0]
-                if audio_chunk is None or audio_chunk.numel() == 0:
+                if self._audio_chunk_is_empty(audio_chunk):
                     continue
 
                 mp3_chunk = encoder.encode(

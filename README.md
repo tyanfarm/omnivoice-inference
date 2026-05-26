@@ -13,5 +13,7 @@ uv pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url http
 
 uv pip install omnivoice
 
-uvicorn streaming_api_omnivoice:app --host 0.0.0.0 --port 9000 --reload
+uv pip install "lameenc==1.8.2"
+
+uvicorn streaming_api_omnivoice:app --host 0.0.0.0 --port 9000
 ```
