@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OmniVoice Streaming Test</title>
+    <style>
+      :root {
+        --bg: #f3efe5;
+        --panel: rgba(255, 252, 245, 0.92);
+        --ink: #1c1a16;
+        --muted: #5d564c;
+        --accent: #9d3c1e;
+        --accent-2: #1f6b5f;
+        --border: rgba(28, 26, 22, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(157, 60, 30, 0.16), transparent 30%),
+          radial-gradient(circle at bottom right, rgba(31, 107, 95, 0.18), transparent 35%),
+          linear-gradient(135deg, #f6f0e2, #ece6da 45%, #f6f2ec);
+        padding: 24px;
+      }
+
+      .layout {
+        max-width: 1100px;
+        margin: 0 auto;
+        display: grid;
+        grid-template-columns: 1.25fr 0.85fr;
+        gap: 20px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        padding: 24px;
+        backdrop-filter: blur(12px);
+        box-shadow: 0 18px 60px rgba(39, 32, 24, 0.08);
+      }
+
+      h1 {
+        font-family: "Space Grotesk", "IBM Plex Sans", sans-serif;
+        font-size: clamp(2rem, 5vw, 3.5rem);
+        line-height: 0.95;
+        margin: 0 0 10px;
+      }
+
+      p {
+        margin: 0 0 18px;
+        color: var(--muted);
+      }
+
+      form {
+        display: grid;
+        gap: 14px;
+      }
+
+      label {
+        display: grid;
+        gap: 8px;
+        font-size: 0.95rem;
+        font-weight: 600;
+      }
+
+      input,
+      textarea {
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 12px 14px;
+        font: inherit;
+        color: var(--ink);
+        background: rgba(255, 255, 255, 0.8);
+      }
+
+      textarea {
+        min-height: 132px;
+        resize: vertical;
+      }
+
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+
+      .actions {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      audio {
+        width: 100%;
+        margin-top: 12px;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 12px 18px;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      .primary {
+        color: #fff8ef;
+        background: linear-gradient(135deg, var(--accent), #c95f32);
+      }
+
+      .secondary {
+        color: var(--ink);
+        background: rgba(28, 26, 22, 0.08);
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: rgba(31, 107, 95, 0.1);
+        color: var(--accent-2);
+        font-weight: 700;
+        margin-bottom: 12px;
+      }
+
+      .status {
+        margin-bottom: 14px;
+        min-height: 24px;
+        font-weight: 700;
+      }
+
+      .metrics {
+        margin: 0 0 14px;
+        min-height: 24px;
+        color: var(--accent-2);
+        font-weight: 700;
+      }
+
+      .log {
+        min-height: 360px;
+        max-height: 540px;
+        overflow: auto;
+        white-space: pre-wrap;
+        border-radius: 18px;
+        padding: 16px;
+        background: #1f1a17;
+        color: #f5efe6;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.9rem;
+      }
+
+      a {
+        color: var(--accent);
+        font-weight: 700;
+      }
+
+      @media (max-width: 860px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+
+        .row {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <section class="panel">
+        <div class="badge">MP3 streaming playback</div>
+        <h1>OmniVoice stream test</h1>
+        <p>
+          This page starts a direct MP3 streaming request and plays it through
+          the browser audio element so you can test the remaining
+          <code>/api/stream-mp3</code> API.
+        </p>
+
+        <form id="stream-form">
+          <label>
+            Text
+            <textarea id="text" name="text">Trong kỷ nguyên số hóa phát triển với tốc độ chóng mặt như hiện nay, thế giới xung quanh chúng ta đang thay đổi từng ngày, từng giờ. Những công nghệ mới ra đời không chỉ tái định hình cách chúng ta làm việc, giao tiếp mà còn thay đổi cả cách tư duy và vận hành cuộc sống.</textarea>
+          </label>
+
+          <div class="row">
+            <label>
+              Reference audio
+              <input id="ref_audio" name="ref_audio" value="am_michael.mp3">
+            </label>
+
+            <label>
+              Language
+              <input id="language" name="language" value="vi">
+            </label>
+          </div>
+
+          <label>
+            Reference text
+            <textarea id="ref_text" name="ref_text">Human just went farther from earth than ever before. This was the mission to go back to the moon, with the goal of eventually establishing a moon colony.</textarea>
+          </label>
+
+          <div class="row">
+            <label>
+              Speed
+              <input id="speed" name="speed" type="number" min="0.5" max="2.0" step="0.1" value="0.9">
+            </label>
+
+            <label>
+              Chunk chars
+              <input id="chunk_chars" name="chunk_chars" type="number" min="40" max="600" step="10" value="120">
+            </label>
+          </div>
+
+          <div class="actions">
+            <button class="primary" type="submit">Play MP3 stream</button>
+            <button class="secondary" type="button" id="stop-button">Stop</button>
+          </div>
+
+          <audio id="mp3-audio" controls></audio>
+        </form>
+      </section>
+
+      <aside class="panel">
+        <div id="status" class="status">Idle</div>
+        <p id="metrics" class="metrics">TTFT: -</p>
+        <div id="log" class="log"></div>
+      </aside>
+    </div>
+
+    <script>
+      const form = document.getElementById("stream-form");
+      const mp3Audio = document.getElementById("mp3-audio");
+      const stopButton = document.getElementById("stop-button");
+      const statusNode = document.getElementById("status");
+      const metricsNode = document.getElementById("metrics");
+      const logNode = document.getElementById("log");
+      let abortController = null;
+      let mediaSource = null;
+      let sourceBuffer = null;
+      let mediaSourceUrl = null;
+      let pendingChunks = [];
+      let streamEnded = false;
+      let mp3StreamStartedAt = null;
+      let mp3TtftLogged = false;
+
+      function setStatus(message) {
+        statusNode.textContent = message;
+      }
+
+      function setMetrics(message) {
+        metricsNode.textContent = message;
+      }
+
+      function log(message) {
+        const timestamp = new Date().toLocaleTimeString();
+        logNode.textContent += `[${timestamp}] ${message}\n`;
+        logNode.scrollTop = logNode.scrollHeight;
+      }
+
+      function resetMetrics() {
+        mp3StreamStartedAt = null;
+        mp3TtftLogged = false;
+        setMetrics("TTFT: -");
+      }
+
+      function formatMilliseconds(value) {
+        return `${Math.round(value)} ms`;
+      }
+
+      function normalizeRefAudioPath(value) {
+        if (!value) {
+          return null;
+        }
+
+        if (value.includes("/")) {
+          return value;
+        }
+
+        return `voices/${value}`;
+      }
+
+      function resetStreamingState() {
+        pendingChunks = [];
+        streamEnded = false;
+        sourceBuffer = null;
+        mediaSource = null;
+      }
+
+      function revokeMediaSourceUrl() {
+        if (mediaSourceUrl) {
+          URL.revokeObjectURL(mediaSourceUrl);
+          mediaSourceUrl = null;
+        }
+      }
+
+      function stopCurrentPlayback() {
+        if (abortController) {
+          abortController.abort();
+          abortController = null;
+        }
+
+        mp3Audio.pause();
+        mp3Audio.removeAttribute("src");
+        mp3Audio.load();
+        revokeMediaSourceUrl();
+        resetStreamingState();
+      }
+
+      function reportMp3Ttft() {
+        if (mp3TtftLogged || mp3StreamStartedAt === null) {
+          return;
+        }
+
+        const ttftMs = performance.now() - mp3StreamStartedAt;
+        mp3TtftLogged = true;
+        setMetrics(`MP3 TTFT: ${formatMilliseconds(ttftMs)}`);
+        log(`MP3 TTFT: ${formatMilliseconds(ttftMs)}`);
+      }
+
+      function flushPendingChunks() {
+        if (!sourceBuffer || sourceBuffer.updating) {
+          return;
+        }
+
+        if (pendingChunks.length > 0) {
+          sourceBuffer.appendBuffer(pendingChunks.shift());
+          return;
+        }
+
+        if (streamEnded && mediaSource && mediaSource.readyState === "open") {
+          mediaSource.endOfStream();
+        }
+      }
+
+      function enqueueChunk(chunk) {
+        if (!sourceBuffer) {
+          pendingChunks.push(chunk);
+          return;
+        }
+
+        if (sourceBuffer.updating || pendingChunks.length > 0) {
+          pendingChunks.push(chunk);
+          return;
+        }
+
+        sourceBuffer.appendBuffer(chunk);
+      }
+
+      function createStreamingAudioTarget() {
+        if (!("MediaSource" in window) || !MediaSource.isTypeSupported("audio/mpeg")) {
+          throw new Error("This browser does not support MediaSource MP3 playback");
+        }
+
+        return new Promise((resolve, reject) => {
+          mediaSource = new MediaSource();
+          mediaSourceUrl = URL.createObjectURL(mediaSource);
+          mp3Audio.src = mediaSourceUrl;
+
+          const handleSourceOpen = () => {
+            try {
+              sourceBuffer = mediaSource.addSourceBuffer("audio/mpeg");
+              sourceBuffer.mode = "sequence";
+              sourceBuffer.addEventListener("updateend", flushPendingChunks);
+              resolve();
+            } catch (error) {
+              reject(error);
+            }
+          };
+
+          mediaSource.addEventListener("sourceopen", handleSourceOpen, { once: true });
+        });
+      }
+
+      async function streamMp3WithPost(payload) {
+        abortController = new AbortController();
+        await createStreamingAudioTarget();
+
+        const response = await fetch("/api/stream-mp3", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: abortController.signal,
+        });
+
+        if (!response.ok || !response.body) {
+          throw new Error(`Request failed with status ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            streamEnded = true;
+            flushPendingChunks();
+            break;
+          }
+
+          if (value && value.byteLength > 0) {
+            enqueueChunk(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+          }
+        }
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+
+        const payload = {
+          text: document.getElementById("text").value,
+          ref_audio: normalizeRefAudioPath(
+            document.getElementById("ref_audio").value || null,
+          ),
+          ref_text: document.getElementById("ref_text").value || null,
+          language: document.getElementById("language").value || null,
+          speed: Number(document.getElementById("speed").value),
+          chunk_chars: Number(document.getElementById("chunk_chars").value),
+        };
+
+        try {
+          resetMetrics();
+          stopCurrentPlayback();
+
+          mp3StreamStartedAt = performance.now();
+          mp3TtftLogged = false;
+          setMetrics("TTFT: measuring MP3 stream...");
+
+          logNode.textContent = "";
+          setStatus("Starting MP3 stream");
+          log("Starting direct MP3 stream via POST");
+          const streamPromise = streamMp3WithPost(payload);
+          await mp3Audio.play();
+          await streamPromise;
+        } catch (error) {
+          if (error.name === "AbortError") {
+            setStatus("Stopped");
+            log("Streaming aborted");
+            return;
+          }
+          setStatus("Error");
+          log(`Error: ${error.message}`);
+        }
+      });
+
+      mp3Audio.addEventListener("playing", () => {
+        reportMp3Ttft();
+      });
+
+      stopButton.addEventListener("click", () => {
+        resetMetrics();
+        setStatus("Stopped");
+        stopCurrentPlayback();
+      });
+    </script>
+  </body>
+</html>
