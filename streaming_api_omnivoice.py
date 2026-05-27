@@ -9,7 +9,7 @@ from typing import Generator
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from omnivoice import OmniVoice
 from pydantic import BaseModel, Field
 
@@ -20,6 +20,7 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 PLAYER_PATH = BASE_DIR / "streaming_player.html"
+VOICES_DIR = BASE_DIR / "voices"
 MODEL_ID = "k2-fsa/OmniVoice"
 STREAM_TEXT_CHUNK_SIZE = 240
 WARMUP_TEXT = "Warm up."
@@ -34,11 +35,34 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="OmniVoice Streaming Test API")
 
+VOICE_METADATA: dict[str, dict[str, str]] = {
+    "af_heart": {
+        "name": "Heart",
+        "native_language": "en",
+        "gender": "female",
+        "ref_text": (
+            "Human just went farther from earth than ever before. "
+            "This was the mission to go back to the moon, with the goal of "
+            "eventually establishing a moon colony."
+        ),
+    },
+    "am_michael": {
+        "name": "Michael",
+        "native_language": "en",
+        "gender": "male",
+        "ref_text": (
+            "Human just went farther from earth than ever before. "
+            "This was the mission to go back to the moon, with the goal of "
+            "eventually establishing a moon colony."
+        ),
+    },
+}
+
 
 class StreamRequest(BaseModel):
     text: str
     language: str | None = None
-    ref_audio: str | None = "am_michael.mp3"
+    ref_audio: str | None = "voices/am_michael.mp3"
     ref_text: str | None = (
         "Human just went farther from earth than ever before. "
         "This was the mission to go back to the moon, with the goal of "
@@ -113,6 +137,43 @@ class OmniVoiceStreamingService:
                 preprocess_prompt=True,
             )
         return self._voice_prompt_cache[key]
+
+    @staticmethod
+    def _voice_to_payload(voice_path: Path) -> dict[str, str | None]:
+        voice_id = voice_path.stem
+        metadata = VOICE_METADATA.get(voice_id, {})
+        relative_path = voice_path.relative_to(BASE_DIR).as_posix()
+        return {
+            "id": voice_id,
+            "name": metadata.get("name", voice_id.replace("_", " ").title()),
+            "native_language": metadata.get("native_language"),
+            "gender": metadata.get("gender"),
+            # "file_name": voice_path.name,
+            # "ref_audio": relative_path,
+            # "audio_url": f"/api/voices/{voice_id}/audio",
+            # "ref_text": metadata.get("ref_text"),
+        }
+
+    def list_voices(self) -> list[dict[str, str | None]]:
+        if not VOICES_DIR.exists():
+            return []
+
+        voice_files = sorted(
+            path for path in VOICES_DIR.iterdir() if path.is_file() and path.suffix == ".mp3"
+        )
+        return [self._voice_to_payload(path) for path in voice_files]
+
+    def get_voice(self, voice_id: str) -> dict[str, str | None]:
+        voice_path = VOICES_DIR / f"{voice_id}.mp3"
+        if not voice_path.exists():
+            raise HTTPException(status_code=404, detail=f"Voice not found: {voice_id}")
+        return self._voice_to_payload(voice_path)
+
+    def get_voice_audio_path(self, voice_id: str) -> Path:
+        voice_path = VOICES_DIR / f"{voice_id}.mp3"
+        if not voice_path.exists():
+            raise HTTPException(status_code=404, detail=f"Voice not found: {voice_id}")
+        return voice_path
 
     def _split_text_for_streaming(
         self,
@@ -313,6 +374,26 @@ def health() -> dict[str, object]:
         "model_loaded": service._model is not None,
         "cuda_available": torch.cuda.is_available(),
     }
+
+
+@app.get("/api/voices")
+def list_voices() -> dict[str, object]:
+    voices = service.list_voices()
+    return {
+        "count": len(voices),
+        "voices": voices,
+    }
+
+
+@app.get("/api/voices/{voice_id}")
+def get_voice(voice_id: str) -> dict[str, str | None]:
+    return service.get_voice(voice_id)
+
+
+@app.get("/api/voices/{voice_id}/audio")
+def get_voice_audio(voice_id: str) -> FileResponse:
+    voice_path = service.get_voice_audio_path(voice_id)
+    return FileResponse(voice_path, media_type="audio/mpeg", filename=voice_path.name)
 
 
 @app.post("/api/stream-mp3")
