@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from omnivoice import OmniVoice
 from pydantic import BaseModel, Field
+from voices import VOICE_METADATA
 
 try:
     import lameenc
@@ -24,7 +25,7 @@ VOICES_DIR = BASE_DIR / "voices"
 MODEL_ID = "k2-fsa/OmniVoice"
 STREAM_TEXT_CHUNK_SIZE = 240
 WARMUP_TEXT = "Warm up."
-WARMUP_REF_AUDIO = "voices/am_michael.mp3"
+WARMUP_REF_AUDIO = "voices/af_heart.mp3"
 WARMUP_REF_TEXT = (
     "Human just went farther from earth than ever before. "
     "This was the mission to go back to the moon, with the goal of "
@@ -35,39 +36,10 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="OmniVoice Streaming Test API")
 
-VOICE_METADATA: dict[str, dict[str, str]] = {
-    "af_heart": {
-        "name": "Heart",
-        "native_language": "en",
-        "gender": "female",
-        "ref_text": (
-            "Human just went farther from earth than ever before. "
-            "This was the mission to go back to the moon, with the goal of "
-            "eventually establishing a moon colony."
-        ),
-    },
-    "am_michael": {
-        "name": "Michael",
-        "native_language": "en",
-        "gender": "male",
-        "ref_text": (
-            "Human just went farther from earth than ever before. "
-            "This was the mission to go back to the moon, with the goal of "
-            "eventually establishing a moon colony."
-        ),
-    },
-}
-
-
 class StreamRequest(BaseModel):
     text: str
+    voice_id: str = "af_heart"
     language: str | None = None
-    ref_audio: str | None = "voices/am_michael.mp3"
-    ref_text: str | None = (
-        "Human just went farther from earth than ever before. "
-        "This was the mission to go back to the moon, with the goal of "
-        "eventually establishing a moon colony."
-    )
     instruct: str | None = None
     speed: float | None = 1.0
     num_step: int = Field(default=16, ge=1)
@@ -163,6 +135,24 @@ class OmniVoiceStreamingService:
         )
         return [self._voice_to_payload(path) for path in voice_files]
 
+    def list_voices_paginated(
+        self,
+        page: int,
+        page_size: int,
+    ) -> dict[str, object]:
+        voices = self.list_voices()
+        total = len(voices)
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        return {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "count": len(voices[start:end]),
+            "voices": voices[start:end],
+        }
+
     def get_voice(self, voice_id: str) -> dict[str, str | None]:
         voice_path = VOICES_DIR / f"{voice_id}.mp3"
         if not voice_path.exists():
@@ -174,6 +164,24 @@ class OmniVoiceStreamingService:
         if not voice_path.exists():
             raise HTTPException(status_code=404, detail=f"Voice not found: {voice_id}")
         return voice_path
+
+    def get_voice_clone_config(self, voice_id: str) -> tuple[Path, str]:
+        voice_path = self.get_voice_audio_path(voice_id)
+        metadata = VOICE_METADATA.get(voice_id)
+        if metadata is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice metadata not found: {voice_id}",
+            )
+
+        ref_text = metadata.get("ref_text")
+        if not ref_text:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Voice ref_text not configured: {voice_id}",
+            )
+
+        return voice_path, ref_text
 
     def _split_text_for_streaming(
         self,
@@ -293,10 +301,7 @@ class OmniVoiceStreamingService:
         if not text:
             return
 
-        if request.ref_audio and not request.ref_text:
-            raise ValueError("ref_text is required when using ref_audio")
-
-        ref_audio_path = self._resolve_ref_audio_path(request.ref_audio)
+        ref_audio_path, ref_text = self.get_voice_clone_config(request.voice_id)
 
         speed = request.speed if request.speed is not None else 0.8
         if len(text.split()) <= 4:
@@ -313,10 +318,10 @@ class OmniVoiceStreamingService:
             encoder.set_quality(2)
 
             voice_clone_prompt = None
-            if ref_audio_path and request.ref_text:
+            if ref_audio_path:
                 voice_clone_prompt = self._get_voice_clone_prompt(
                     str(ref_audio_path),
-                    request.ref_text,
+                    ref_text,
                 )
 
             for text_chunk in self._split_text_for_streaming(
@@ -377,12 +382,11 @@ def health() -> dict[str, object]:
 
 
 @app.get("/api/voices")
-def list_voices() -> dict[str, object]:
-    voices = service.list_voices()
-    return {
-        "count": len(voices),
-        "voices": voices,
-    }
+def list_voices(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=100),
+) -> dict[str, object]:
+    return service.list_voices_paginated(page=page, page_size=page_size)
 
 
 @app.get("/api/voices/{voice_id}")
@@ -417,25 +421,19 @@ def stream_mp3_audio(request: StreamRequest) -> StreamingResponse:
 @app.get("/api/stream-mp3")
 def stream_mp3_audio_get(
     text: str = Query(..., min_length=1),
+    voice_id: str = Query(default="af_heart", min_length=1),
     language: str | None = None,
-    ref_audio: str | None = "am_michael.mp3",
-    ref_text: str | None = (
-        "Human just went farther from earth than ever before. "
-        "This was the mission to go back to the moon, with the goal of "
-        "eventually establishing a moon colony."
-    ),
     instruct: str | None = None,
     speed: float | None = 0.9,
     num_step: int = Query(default=16, ge=1),
     denoise: bool = False,
     postprocess_output: bool = False,
-    chunk_chars: int = Query(default=120, ge=40, le=600),
+    chunk_chars: int = Query(default=240, ge=40, le=600),
 ) -> StreamingResponse:
     request = StreamRequest(
         text=text,
+        voice_id=voice_id,
         language=language,
-        ref_audio=ref_audio,
-        ref_text=ref_text,
         instruct=instruct,
         speed=speed,
         num_step=num_step,

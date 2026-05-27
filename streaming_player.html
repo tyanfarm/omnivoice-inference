@@ -73,6 +73,7 @@
       }
 
       input,
+      select,
       textarea {
         width: 100%;
         border: 1px solid var(--border);
@@ -197,8 +198,10 @@
 
           <div class="row">
             <label>
-              Reference audio
-              <input id="ref_audio" name="ref_audio" value="am_michael.mp3">
+              Voice
+              <select id="voice_id" name="voice_id">
+                <option value="af_heart" selected>af_heart</option>
+              </select>
             </label>
 
             <label>
@@ -206,11 +209,6 @@
               <input id="language" name="language" value="vi">
             </label>
           </div>
-
-          <label>
-            Reference text
-            <textarea id="ref_text" name="ref_text">Human just went farther from earth than ever before. This was the mission to go back to the moon, with the goal of eventually establishing a moon colony.</textarea>
-          </label>
 
           <div class="row">
             <label>
@@ -278,18 +276,6 @@
 
       function formatMilliseconds(value) {
         return `${Math.round(value)} ms`;
-      }
-
-      function normalizeRefAudioPath(value) {
-        if (!value) {
-          return null;
-        }
-
-        if (value.includes("/")) {
-          return value;
-        }
-
-        return `voices/${value}`;
       }
 
       function resetStreamingState() {
@@ -415,15 +401,39 @@
         }
       }
 
+      async function loadVoices() {
+        const response = await fetch("/api/voices?page=1&page_size=100");
+        if (!response.ok) {
+          throw new Error(`Failed to load voices: ${response.status}`);
+        }
+
+        const data = await response.json();
+        const voiceSelect = document.getElementById("voice_id");
+        const voices = Array.isArray(data.voices) ? data.voices : [];
+
+        if (voices.length === 0) {
+          return;
+        }
+
+        voiceSelect.innerHTML = "";
+
+        for (const voice of voices) {
+          const option = document.createElement("option");
+          option.value = voice.id;
+          option.textContent = voice.name
+            ? `${voice.name} (${voice.id})`
+            : voice.id;
+          option.selected = voice.id === "af_heart";
+          voiceSelect.appendChild(option);
+        }
+      }
+
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
 
         const payload = {
           text: document.getElementById("text").value,
-          ref_audio: normalizeRefAudioPath(
-            document.getElementById("ref_audio").value || null,
-          ),
-          ref_text: document.getElementById("ref_text").value || null,
+          voice_id: document.getElementById("voice_id").value,
           language: document.getElementById("language").value || null,
           speed: Number(document.getElementById("speed").value),
           chunk_chars: Number(document.getElementById("chunk_chars").value),
@@ -462,6 +472,11 @@
         resetMetrics();
         setStatus("Stopped");
         stopCurrentPlayback();
+      });
+
+      loadVoices().catch((error) => {
+        setStatus("Voice list unavailable");
+        log(`Error: ${error.message}`);
       });
     </script>
   </body>
