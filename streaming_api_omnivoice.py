@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import logging
 import re
-import threading
 from pathlib import Path
 from typing import Generator
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 from omnivoice import OmniVoice
 from pydantic import BaseModel, Field
+
+from admission import AdmissionControl
+from batch_scheduler import BatchScheduler, GenerationJob
 from voices import VOICE_METADATA
 
 try:
@@ -34,7 +41,13 @@ WARMUP_REF_TEXT = (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="OmniVoice Streaming Test API")
+app = FastAPI(
+    title="OmniVoice Streaming Test API",
+    # No published schema: /docs, /redoc, and /openapi.json all 404.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 class StreamRequest(BaseModel):
     text: str
@@ -48,67 +61,70 @@ class StreamRequest(BaseModel):
     chunk_chars: int = Field(default=120, ge=40, le=600)
 
 
+class SpeechRequest(BaseModel):
+    """Body of POST /v1/audio/speech: OpenAI's `input`, plus `voice_id`.
+
+    Everything else — speed, chunking, diffusion steps — comes from
+    StreamRequest's defaults. Unrecognised fields an OpenAI client sends
+    (`model`, `response_format`, `instructions`, ...) are ignored rather than
+    rejected, so a stock client still gets audio. Output is always mp3.
+    """
+
+    input: str = Field(..., min_length=1, max_length=4096)
+    voice_id: str = "af_heart"
+
+    def to_stream_request(self) -> StreamRequest:
+        return StreamRequest(text=self.input, voice_id=self.voice_id)
+
+
 class OmniVoiceStreamingService:
     def __init__(self) -> None:
-        self._model: OmniVoice | None = None
-        self._lock = threading.Lock()
-        self._voice_prompt_cache: dict[tuple[str, str], object] = {}
+        self.scheduler = BatchScheduler(model_factory=self._load_model)
+        self.admission = AdmissionControl()
 
-    def _get_model(self) -> OmniVoice:
-        if self._model is None:
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    @staticmethod
+    def _load_model() -> OmniVoice:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
-            self._model = OmniVoice.from_pretrained(
-                MODEL_ID,
-                device_map=device,
-                dtype=dtype,
-            )
-
-        return self._model
+        return OmniVoice.from_pretrained(MODEL_ID, device_map=device, dtype=dtype)
 
     def warmup(self) -> None:
-        with self._lock:
-            model = self._get_model()
-            generation_kwargs = {
-                "text": WARMUP_TEXT,
-                "speed": 1.0,
-                "num_step": 16,
-                "denoise": False,
-                "postprocess_output": False,
-            }
+        if self.scheduler.sampling_rate > 0:
+            return
 
-            try:
-                ref_audio_path = self._resolve_ref_audio_path(WARMUP_REF_AUDIO)
-                if ref_audio_path is not None:
-                    generation_kwargs["voice_clone_prompt"] = (
-                        self._get_voice_clone_prompt(
-                            str(ref_audio_path),
-                            WARMUP_REF_TEXT,
-                        )
-                    )
-            except FileNotFoundError:
-                logger.warning(
-                    "Warmup reference audio not found at %s; continuing without voice clone prompt",
-                    WARMUP_REF_AUDIO,
-                )
+        self.scheduler.start()
+        if not self.scheduler.wait_ready(timeout=600):
+            raise RuntimeError("OmniVoice model failed to load within 600s")
 
-            model.generate(**generation_kwargs)
-
-    def _get_voice_clone_prompt(self, ref_audio: str, ref_text: str):
-        key = (ref_audio, ref_text)
-        if key not in self._voice_prompt_cache:
-            model = self._get_model()
-            self._voice_prompt_cache[key] = model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-                preprocess_prompt=True,
+        try:
+            ref_audio_path = self._resolve_ref_audio_path(WARMUP_REF_AUDIO)
+        except FileNotFoundError:
+            logger.warning(
+                "Warmup reference audio not found at %s; skipping warmup generation",
+                WARMUP_REF_AUDIO,
             )
-        return self._voice_prompt_cache[key]
+            return
+
+        if ref_audio_path is None:
+            return
+
+        job = GenerationJob(
+            text=WARMUP_TEXT,
+            ref_audio=str(ref_audio_path),
+            ref_text=WARMUP_REF_TEXT,
+            language=None,
+            speed=1.0,
+            num_step=16,
+            denoise=False,
+            postprocess_output=False,
+        )
+        self.scheduler.submit(job)
+        job.result(timeout=600)
 
     @staticmethod
     def _voice_to_payload(voice_path: Path) -> dict[str, str | None]:
@@ -292,57 +308,48 @@ class OmniVoiceStreamingService:
     def text_to_speech_stream(
         self,
         request: StreamRequest,
+        slot=None,
     ) -> Generator[bytes, None, None]:
         """Stream MP3 audio bytes generated from OmniVoice text chunks."""
         if lameenc is None:
             raise RuntimeError("lameenc is required for MP3 streaming")
 
-        text = request.text.strip()
-        if not text:
-            return
+        pending: GenerationJob | None = None
+        try:
+            text = request.text.strip()
+            if not text:
+                return
 
-        ref_audio_path, ref_text = self.get_voice_clone_config(request.voice_id)
+            ref_audio_path, ref_text = self.get_voice_clone_config(request.voice_id)
 
-        speed = request.speed if request.speed is not None else 0.8
-        if len(text.split()) <= 4:
-            speed = 1.0
-
-        with self._lock:
-            model = self._get_model()
-            sample_rate = model.sampling_rate
+            speed = request.speed if request.speed is not None else 0.8
+            if len(text.split()) <= 4:
+                speed = 1.0
 
             encoder = lameenc.Encoder()
             encoder.set_bit_rate(128)
-            encoder.set_in_sample_rate(sample_rate)
+            encoder.set_in_sample_rate(self.scheduler.sampling_rate)
             encoder.set_channels(1)
             encoder.set_quality(2)
-
-            voice_clone_prompt = None
-            if ref_audio_path:
-                voice_clone_prompt = self._get_voice_clone_prompt(
-                    str(ref_audio_path),
-                    ref_text,
-                )
 
             for text_chunk in self._split_text_for_streaming(
                 text,
                 max_chars=request.chunk_chars,
             ):
-                generation_kwargs = {
-                    "text": text_chunk,
-                    "language": request.language,
-                    "speed": speed,
-                    "num_step": request.num_step,
-                    "denoise": request.denoise,
-                    "postprocess_output": request.postprocess_output,
-                }
+                pending = GenerationJob(
+                    text=text_chunk,
+                    ref_audio=str(ref_audio_path),
+                    ref_text=ref_text,
+                    language=request.language,
+                    speed=speed,
+                    num_step=request.num_step,
+                    denoise=request.denoise,
+                    postprocess_output=request.postprocess_output,
+                )
+                self.scheduler.submit(pending)
+                audio_chunk = pending.result()
+                pending = None
 
-                if voice_clone_prompt is not None:
-                    generation_kwargs["voice_clone_prompt"] = voice_clone_prompt
-                elif request.instruct:
-                    generation_kwargs["instruct"] = request.instruct
-
-                audio_chunk = model.generate(**generation_kwargs)[0]
                 if self._audio_chunk_is_empty(audio_chunk):
                     continue
 
@@ -355,6 +362,13 @@ class OmniVoiceStreamingService:
             final_chunk = encoder.flush()
             if final_chunk:
                 yield bytes(final_chunk)
+        finally:
+            # Reached on normal completion and on GeneratorExit when the
+            # client disconnects mid-stream.
+            if pending is not None:
+                pending.cancel()
+            if slot is not None:
+                slot.release()
 
 
 service = OmniVoiceStreamingService()
@@ -376,7 +390,7 @@ def index() -> HTMLResponse:
 def health() -> dict[str, object]:
     return {
         "status": "ok",
-        "model_loaded": service._model is not None,
+        "model_loaded": service.scheduler.sampling_rate > 0,
         "cuda_available": torch.cuda.is_available(),
     }
 
@@ -400,22 +414,95 @@ def get_voice_audio(voice_id: str) -> FileResponse:
     return FileResponse(voice_path, media_type="audio/mpeg", filename=voice_path.name)
 
 
-@app.post("/api/stream-mp3")
-def stream_mp3_audio(request: StreamRequest) -> StreamingResponse:
+def _start_mp3_stream(request: StreamRequest, filename: str) -> StreamingResponse:
+    """Admit one stream and hand back its response.
+
+    Raises HTTPException — 500 without lameenc, 503 when the server is full, or
+    whatever get_voice_clone_config raises — for the caller to shape into its
+    own error format.
+    """
     if lameenc is None:
         raise HTTPException(
             status_code=500,
             detail="Install lameenc in the venv to use MP3 streaming",
         )
 
+    slot = service.admission.try_acquire()
+    if slot is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Too many concurrent streams; retry shortly",
+            headers={"Retry-After": "5"},
+        )
+
+    try:
+        # Resolve the voice before streaming starts so a bad voice_id is a
+        # clean 404 rather than a truncated audio stream.
+        service.get_voice_clone_config(request.voice_id)
+    except HTTPException:
+        slot.release()
+        raise
+
     return StreamingResponse(
-        service.text_to_speech_stream(request),
+        service.text_to_speech_stream(request, slot=slot),
         media_type="audio/mpeg",
         headers={
             "Cache-Control": "no-cache",
-            "Content-Disposition": 'inline; filename="omnivoice-stream.mp3"',
+            "Content-Disposition": f'inline; filename="{filename}"',
         },
     )
+
+
+@app.post("/api/stream-mp3")
+def stream_mp3_audio(request: StreamRequest) -> StreamingResponse:
+    return _start_mp3_stream(request, "omnivoice-stream.mp3")
+
+
+def _openai_error(
+    status_code: int,
+    message: str,
+    param: str | None = None,
+    error_type: str = "invalid_request_error",
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    """OpenAI's error envelope, which its client libraries parse for `message`."""
+    return JSONResponse(
+        status_code=status_code,
+        headers=headers,
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": param,
+                "code": None,
+            }
+        },
+    )
+
+
+@app.post("/v1/audio/speech")
+def create_speech(request: SpeechRequest) -> Response:
+    """OpenAI-compatible text-to-speech.
+
+    Same engine and admission control as /api/stream-mp3; only the request
+    schema and the error envelope differ. Audio is streamed as it is generated
+    rather than buffered, which OpenAI's client handles transparently.
+    """
+    try:
+        return _start_mp3_stream(request.to_stream_request(), "speech.mp3")
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            return _openai_error(
+                503,
+                str(exc.detail),
+                error_type="server_error",
+                headers={"Retry-After": "5"},
+            )
+        # A missing voice is a 404 internally, but OpenAI reports an unknown
+        # voice as a 400 invalid_request_error, so clients see what they expect.
+        if exc.status_code in (400, 404):
+            return _openai_error(400, str(exc.detail), param="voice")
+        return _openai_error(exc.status_code, str(exc.detail), error_type="server_error")
 
 
 @app.get("/api/stream-mp3")

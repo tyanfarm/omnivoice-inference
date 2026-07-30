@@ -7,3 +7,6 @@ numpy==2.2.6
 
 ## Install pytorch with your CUDA version, e.g.
 # pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
+
+## Dev / test only
+# pip install pytest==8.3.4 pytest-timeout==2.3.1
