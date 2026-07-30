@@ -20,28 +20,34 @@ uvicorn streaming_api_omnivoice:app --host 0.0.0.0 --port 9000
 
 ## OpenAI-compatible endpoint
 
-`POST /v1/audio/speech` streams mp3 using OpenAI's path and `input` field. Same
+`POST /v1/audio/speech` streams audio using OpenAI's path and `input` field. Same
 engine, admission control, and batching as `/api/stream-mp3`.
 
 ```sh
 curl -X POST http://localhost:9000/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"input":"Hello there.","voice_id":"af_heart"}' \
+  -d '{"input":"Hello there.","voice":"af_heart"}' \
   --output speech.mp3
 ```
 
-Two fields, both from `/api/stream-mp3`'s vocabulary:
+Three fields:
 
-- **`input`** — the text (required, up to 4096 characters).
-- **`voice_id`** — `af_heart`, `am_michael`, `vf_phuong`, `vm_thanh`,
-  `vf_quynh` (see `GET /api/voices`). Defaults to `af_heart`. An unknown id is
-  a 400 rather than a silent substitution with some other speaker.
+- **`input`** — the text (required, no length limit; it is split into chunks and
+  streamed as each one finishes).
+- **`voice`** — `af_heart`, `am_michael`, `vf_phuong`, `vm_thanh`, `vf_quynh`
+  (see `GET /api/voices`). Defaults to `vf_phuong`. An unknown voice is a 400
+  rather than a silent substitution with some other speaker.
+- **`response_format`** — `mp3` (default), `wav`, or `pcm`. `opus`, `aac`, and
+  `flac` are not produced; asking for one is a 400 that names the formats that
+  work. `wav` is a 44-byte RIFF header followed by the same bytes `pcm` returns:
+  16-bit signed little-endian mono at the model's 24 kHz. Because the length is
+  unknown while streaming, the header's size fields carry `0xFFFFFFFF` and
+  players read to end-of-stream.
 
 Everything else — speed, chunking, diffusion steps — uses the same defaults as
-`/api/stream-mp3`. Extra fields a stock OpenAI client sends (`model`,
-`response_format`, `speed`, `instructions`) are ignored rather than rejected, so
-those clients still work; **output is always mp3** regardless of
-`response_format`. No `Authorization` header is required; one sent is ignored.
+`/api/stream-mp3`. Extra fields a stock OpenAI client sends (`model`, `speed`,
+`instructions`) are ignored rather than rejected, so those clients still work.
+No `Authorization` header is required; one sent is ignored.
 
 Errors use OpenAI's envelope:
 

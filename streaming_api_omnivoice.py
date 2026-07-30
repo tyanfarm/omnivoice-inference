@@ -18,13 +18,9 @@ from omnivoice import OmniVoice
 from pydantic import BaseModel, Field
 
 from admission import AdmissionControl
+from audio_formats import SUPPORTED_FORMATS, AudioEncoder, create_encoder
 from batch_scheduler import BatchScheduler, GenerationJob
 from voices import VOICE_METADATA
-
-try:
-    import lameenc
-except ImportError:
-    lameenc = None
 
 BASE_DIR = Path(__file__).resolve().parent
 PLAYER_PATH = BASE_DIR / "streaming_player.html"
@@ -62,18 +58,22 @@ class StreamRequest(BaseModel):
 
 
 class SpeechRequest(BaseModel):
-    """Body of POST /v1/audio/speech: OpenAI's `input` and `voice`.
+    """Body of POST /v1/audio/speech: OpenAI's `input`, `voice`, `response_format`.
 
     `input` is unbounded — text_to_speech_stream already splits it into chunks,
     so length costs time rather than memory. Everything else — speed, chunking,
     diffusion steps — comes from StreamRequest's defaults. Unrecognised fields
-    an OpenAI client sends (`model`, `response_format`, `instructions`, ...) are
-    ignored rather than rejected, so a stock client still gets audio. Output is
-    always mp3.
+    an OpenAI client sends (`model`, `instructions`, ...) are ignored rather
+    than rejected, so a stock client still gets audio.
+
+    `response_format` is a plain str, not a Literal, so an unsupported value
+    comes back as an OpenAI-shaped 400 naming the formats that do work instead
+    of a bare pydantic 422.
     """
 
     input: str = Field(..., min_length=1)
     voice: str = "vf_phuong"
+    response_format: str = "mp3"
 
     def to_stream_request(self) -> StreamRequest:
         return StreamRequest(text=self.input, voice_id=self.voice)
@@ -311,10 +311,14 @@ class OmniVoiceStreamingService:
         self,
         request: StreamRequest,
         slot=None,
+        encoder: AudioEncoder | None = None,
     ) -> Generator[bytes, None, None]:
-        """Stream MP3 audio bytes generated from OmniVoice text chunks."""
-        if lameenc is None:
-            raise RuntimeError("lameenc is required for MP3 streaming")
+        """Stream encoded audio bytes generated from OmniVoice text chunks.
+
+        `encoder` decides the wire format (mp3, wav, pcm) and defaults to mp3.
+        """
+        if encoder is None:
+            encoder = create_encoder("mp3", self.scheduler.sampling_rate)
 
         pending: GenerationJob | None = None
         try:
@@ -328,11 +332,9 @@ class OmniVoiceStreamingService:
             if len(text.split()) <= 4:
                 speed = 1.0
 
-            encoder = lameenc.Encoder()
-            encoder.set_bit_rate(128)
-            encoder.set_in_sample_rate(self.scheduler.sampling_rate)
-            encoder.set_channels(1)
-            encoder.set_quality(2)
+            leading = encoder.begin()
+            if leading:
+                yield leading
 
             for text_chunk in self._split_text_for_streaming(
                 text,
@@ -355,15 +357,15 @@ class OmniVoiceStreamingService:
                 if self._audio_chunk_is_empty(audio_chunk):
                     continue
 
-                mp3_chunk = encoder.encode(
+                encoded = encoder.encode(
                     self._audio_tensor_to_int16_bytes(audio_chunk)
                 )
-                if mp3_chunk:
-                    yield bytes(mp3_chunk)
+                if encoded:
+                    yield encoded
 
             final_chunk = encoder.flush()
             if final_chunk:
-                yield bytes(final_chunk)
+                yield final_chunk
         finally:
             # Reached on normal completion and on GeneratorExit when the
             # client disconnects mid-stream.
@@ -416,18 +418,28 @@ def get_voice_audio(voice_id: str) -> FileResponse:
     return FileResponse(voice_path, media_type="audio/mpeg", filename=voice_path.name)
 
 
-def _start_mp3_stream(request: StreamRequest, filename: str) -> StreamingResponse:
-    """Admit one stream and hand back its response.
+def _start_audio_stream(
+    request: StreamRequest,
+    filename_stem: str,
+    response_format: str = "mp3",
+) -> StreamingResponse:
+    """Admit one stream and hand back its response in `response_format`.
 
-    Raises HTTPException — 500 without lameenc, 503 when the server is full, or
-    whatever get_voice_clone_config raises — for the caller to shape into its
-    own error format.
+    Raises HTTPException — 400 for an unknown format, 500 when its encoder is
+    not installed, 503 when the server is full, or whatever
+    get_voice_clone_config raises — for the caller to shape into its own error
+    format.
+
+    The encoder is built before the slot is taken so a bad format cannot leak
+    one, and before streaming starts so a missing backend is a clean error
+    rather than a truncated body.
     """
-    if lameenc is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Install lameenc in the venv to use MP3 streaming",
-        )
+    try:
+        encoder = create_encoder(response_format, service.scheduler.sampling_rate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     slot = service.admission.try_acquire()
     if slot is None:
@@ -445,9 +457,10 @@ def _start_mp3_stream(request: StreamRequest, filename: str) -> StreamingRespons
         slot.release()
         raise
 
+    filename = f"{filename_stem}.{encoder.extension}"
     return StreamingResponse(
-        service.text_to_speech_stream(request, slot=slot),
-        media_type="audio/mpeg",
+        service.text_to_speech_stream(request, slot=slot, encoder=encoder),
+        media_type=encoder.media_type,
         headers={
             "Cache-Control": "no-cache",
             "Content-Disposition": f'inline; filename="{filename}"',
@@ -457,7 +470,7 @@ def _start_mp3_stream(request: StreamRequest, filename: str) -> StreamingRespons
 
 @app.post("/api/stream-mp3")
 def stream_mp3_audio(request: StreamRequest) -> StreamingResponse:
-    return _start_mp3_stream(request, "omnivoice-stream.mp3")
+    return _start_audio_stream(request, "omnivoice-stream")
 
 
 def _openai_error(
@@ -487,11 +500,26 @@ def create_speech(request: SpeechRequest) -> Response:
     """OpenAI-compatible text-to-speech.
 
     Same engine and admission control as /api/stream-mp3; only the request
-    schema and the error envelope differ. Audio is streamed as it is generated
-    rather than buffered, which OpenAI's client handles transparently.
+    schema, the output format and the error envelope differ. Audio is streamed
+    as it is generated rather than buffered, which OpenAI's client handles
+    transparently.
     """
+    if request.response_format not in SUPPORTED_FORMATS:
+        # Checked here rather than in _start_audio_stream so the error names
+        # response_format as the offending parameter instead of voice.
+        return _openai_error(
+            400,
+            f"Unsupported response_format '{request.response_format}'. "
+            f"Supported formats: {', '.join(SUPPORTED_FORMATS)}",
+            param="response_format",
+        )
+
     try:
-        return _start_mp3_stream(request.to_stream_request(), "speech.mp3")
+        return _start_audio_stream(
+            request.to_stream_request(),
+            "speech",
+            response_format=request.response_format,
+        )
     except HTTPException as exc:
         if exc.status_code == 503:
             return _openai_error(
