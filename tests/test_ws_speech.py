@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import json
 import re
-
-import pytest
+import threading
+import time
 
 from audio_formats import WAV_HEADER_SIZE, wav_header
 
@@ -204,4 +204,89 @@ def test_a_client_disconnecting_mid_session_leaks_no_slot(client):
     with connect(client) as socket:
         socket.send_json({"type": "text", "text": "job-1."})
         socket.receive()  # first audio frame, then walk away
+    assert api.service.admission.active == 0
+
+
+def test_the_session_closes_itself_after_the_idle_timeout(client, monkeypatch):
+    # The client stops sending text and never says "done" — the common case
+    # when an LLM stream just ends. The server must not hold the slot.
+    import streaming_api_omnivoice as api
+    import ws_session
+
+    monkeypatch.setattr(ws_session, "WS_IDLE_TIMEOUT_S", 0.3)
+
+    with connect(client) as socket:
+        socket.send_json({"type": "text", "text": "job-1."})
+        frames, final = audio_frames(socket)
+
+    assert frames, "buffered audio should still be delivered"
+    assert final["type"] == "done"
+    assert api.service.admission.active == 0
+
+
+def test_idle_flush_speaks_text_that_never_got_a_terminator(client, monkeypatch):
+    # A trailing fragment must not be silently dropped when the stream ends.
+    import ws_session
+
+    monkeypatch.setattr(ws_session, "WS_IDLE_TIMEOUT_S", 0.3)
+    client.fake_model.calls.clear()
+
+    with connect(client) as socket:
+        socket.send_json({"type": "text", "text": "job-2 without a period"})
+        audio_frames(socket)
+
+    assert any("job-2" in text for text in spoken_texts(client)), spoken_texts(client)
+
+
+def test_the_idle_timer_resets_on_every_text_message(client, monkeypatch):
+    # A slow LLM sending a word every 0.1s must not be cut off at 0.3s.
+    import ws_session
+
+    monkeypatch.setattr(ws_session, "WS_IDLE_TIMEOUT_S", 0.3)
+
+    with connect(client) as socket:
+        for i in range(5):
+            socket.send_json({"type": "text", "text": f"job-{i} "})
+            time.sleep(0.1)
+        socket.send_json({"type": "text", "text": "end."})
+        socket.send_json({"type": "done"})
+        frames, final = audio_frames(socket)
+
+    assert final["type"] == "done"
+    assert frames
+
+
+def test_the_hard_ceiling_ends_a_session_that_never_stops(client, monkeypatch):
+    # A client trickling text just under the idle timeout forever would hold a
+    # slot indefinitely; max_session_s is the backstop. The trickle runs on its
+    # own thread so the main thread can block waiting for the server to close.
+    import streaming_api_omnivoice as api
+    import ws_session
+
+    monkeypatch.setattr(ws_session, "WS_MAX_SESSION_S", 0.5)
+    monkeypatch.setattr(ws_session, "WS_IDLE_TIMEOUT_S", 5.0)
+
+    with connect(client) as socket:
+        stop = threading.Event()
+
+        def trickle():
+            while not stop.is_set():
+                try:
+                    socket.send_json({"type": "text", "text": "job-1 "})
+                except Exception:
+                    return  # the server closed on us, which is the point
+                time.sleep(0.1)
+
+        writer = threading.Thread(target=trickle, daemon=True)
+        writer.start()
+        try:
+            started = time.monotonic()
+            _, final = audio_frames(socket)
+            elapsed = time.monotonic() - started
+        finally:
+            stop.set()
+            writer.join(timeout=2)
+
+    assert final["type"] == "done"
+    assert elapsed < 3.0, f"ceiling did not end the session; waited {elapsed:.1f}s"
     assert api.service.admission.active == 0
