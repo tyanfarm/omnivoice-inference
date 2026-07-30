@@ -74,10 +74,52 @@ Client sends JSON text frames:
 - `{"type":"flush"}` — speak the buffer now, terminator or not.
 - `{"type":"done"}` — no more text; finish the audio and close.
 
-Server sends binary frames of audio, then one `{"type":"done"}` before closing.
-Errors arrive as `{"error":{...}}` in the same envelope the HTTP endpoint uses,
-followed by a close code: `1008` bad voice or format, `1013` over capacity,
-`1011` server error.
+### What the server sends
+
+Binary frames of audio, then exactly **one** JSON text frame — either
+`{"type":"done"}` or an `{"error":{...}}` — then a close. Never both.
+
+```ts
+type ClientFrame =
+  | { type: "text"; text: string }   // append text
+  | { type: "flush" }                // speak the buffer now
+  | { type: "done" };                // finish and close
+
+type ServerFrame = ArrayBuffer | { type: "done" } | ErrorFrame;
+
+interface ErrorFrame {
+  error: {
+    message: string;
+    type: "invalid_request_error" | "server_error";
+    param: "voice" | "response_format" | "type" | "text" | null;
+    code: null;                       // always null; present for OpenAI parity
+  };
+}
+```
+
+Audio is 24000 Hz mono in every format:
+
+| `response_format` | Wire bytes | Leading frame | Duration |
+|---|---|---|---|
+| `pcm` (default) | signed 16-bit little-endian, headerless | none | `bytes / 2 / 24000` |
+| `wav` | 44-byte RIFF header then the same bytes `pcm` sends | one 44-byte frame, before any audio | `(bytes - 44) / 2 / 24000` |
+| `mp3` | MPEG-1 Layer III, 128 kbps CBR, LAME quality 2 | none | not derivable; LAME buffers |
+
+Client-side notes that matter:
+
+- **No empty binary frames are ever sent** — silent chunks and empty encoder
+  output are dropped, so `byteLength > 0` always holds.
+- **An `error` frame can arrive after some audio.** A failure on the third
+  sentence still leaves the first two delivered; error does not imply zero bytes.
+- `pcm` and `wav` send one frame per text chunk. `mp3` sends fewer, because
+  `encode()` returns nothing while LAME fills a frame.
+- **`wav`'s streaming header declares `0xFFFFFFFF` sizes**, since the length is
+  unknown mid-stream. ffmpeg and browsers read to end-of-stream and are fine;
+  stricter players want the real size patched in once the stream ends, which
+  `ws_client.py` demonstrates.
+
+Close codes: `1000` done, `1008` bad voice / format / message, `1013` over
+capacity, `1011` generation or encoder failure.
 
 **The session closes itself after 5s with no `text` message**
 (`OMNIVOICE_WS_IDLE_TIMEOUT_S`), flushing whatever is buffered first. Set this
