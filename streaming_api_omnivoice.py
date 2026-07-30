@@ -62,19 +62,21 @@ class StreamRequest(BaseModel):
 
 
 class SpeechRequest(BaseModel):
-    """Body of POST /v1/audio/speech: OpenAI's `input`, plus `voice_id`.
+    """Body of POST /v1/audio/speech: OpenAI's `input` and `voice`.
 
-    Everything else — speed, chunking, diffusion steps — comes from
-    StreamRequest's defaults. Unrecognised fields an OpenAI client sends
-    (`model`, `response_format`, `instructions`, ...) are ignored rather than
-    rejected, so a stock client still gets audio. Output is always mp3.
+    `input` is unbounded — text_to_speech_stream already splits it into chunks,
+    so length costs time rather than memory. Everything else — speed, chunking,
+    diffusion steps — comes from StreamRequest's defaults. Unrecognised fields
+    an OpenAI client sends (`model`, `response_format`, `instructions`, ...) are
+    ignored rather than rejected, so a stock client still gets audio. Output is
+    always mp3.
     """
 
-    input: str = Field(..., min_length=1, max_length=4096)
-    voice_id: str = "af_heart"
+    input: str = Field(..., min_length=1)
+    voice: str = "vf_phuong"
 
     def to_stream_request(self) -> StreamRequest:
-        return StreamRequest(text=self.input, voice_id=self.voice_id)
+        return StreamRequest(text=self.input, voice_id=self.voice)
 
 
 class OmniVoiceStreamingService:
