@@ -16,9 +16,17 @@ Environment:
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from typing import Callable
+
+import anyio
+import anyio.to_thread
+import numpy as np
+
+from admission import MAX_STREAMS
+from batch_scheduler import GenerationJob
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +38,27 @@ PENDING_CHUNKS = 8
 # A client that streams text far faster than the GPU speaks it is a bug, not a
 # workload; refuse rather than buffer without bound.
 MAX_PENDING_CHARS = 8000
+# Its own limiter, sized to the admission cap, so TTS waits can never exhaust
+# the shared threadpool Starlette needs for its own sync endpoints.
+TTS_THREAD_LIMITER = anyio.CapacityLimiter(MAX_STREAMS)
+# A chunk that has not come back in this long means the worker died; fail the
+# session rather than hold a slot forever.
+JOB_TIMEOUT_S = 120.0
+
+
+async def await_job(job: GenerationJob, timeout: float = JOB_TIMEOUT_S) -> np.ndarray:
+    """Wait for one generated chunk without blocking the event loop.
+
+    job.result() is a blocking queue.get, so it runs on a worker thread. The
+    thread is held only while that chunk generates, never for the life of the
+    socket. abandon_on_cancel lets a disconnect return immediately instead of
+    waiting on a get that nobody will answer; the caller cancels the job.
+    """
+    return await anyio.to_thread.run_sync(
+        functools.partial(job.result, timeout),
+        limiter=TTS_THREAD_LIMITER,
+        abandon_on_cancel=True,
+    )
 
 
 class SentenceBuffer:
