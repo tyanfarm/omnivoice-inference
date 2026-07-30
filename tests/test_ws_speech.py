@@ -150,3 +150,58 @@ def test_a_generation_failure_is_reported_as_a_server_error(client):
         socket.send_json({"type": "text", "text": "job-9."})
         payload = first_json(socket)
     assert payload["error"]["type"] == "server_error"
+
+
+def test_an_unknown_voice_is_reported_before_any_audio(client):
+    with connect(client, voice="does-not-exist") as socket:
+        payload = first_json(socket)
+    assert payload["error"]["param"] == "voice"
+    assert payload["error"]["type"] == "invalid_request_error"
+
+
+def test_an_unsupported_format_is_reported(client):
+    with connect(client, response_format="opus") as socket:
+        payload = first_json(socket)
+    assert payload["error"]["param"] == "response_format"
+    for name in ("mp3", "wav", "pcm"):
+        assert name in payload["error"]["message"]
+
+
+def test_over_capacity_is_refused_with_a_server_error(client):
+    import streaming_api_omnivoice as api
+
+    held = api.service.admission.try_acquire()
+    assert held is not None
+    try:
+        with connect(client) as socket:
+            payload = first_json(socket)
+        assert payload["error"]["type"] == "server_error"
+    finally:
+        held.release()
+
+
+def test_the_slot_is_returned_when_the_session_ends(client):
+    import streaming_api_omnivoice as api
+
+    with connect(client) as socket:
+        socket.send_json({"type": "text", "text": "job-1."})
+        socket.send_json({"type": "done"})
+        audio_frames(socket)
+    assert api.service.admission.active == 0
+
+
+def test_a_refused_handshake_leaks_no_slot(client):
+    import streaming_api_omnivoice as api
+
+    with connect(client, voice="nope") as socket:
+        first_json(socket)
+    assert api.service.admission.active == 0
+
+
+def test_a_client_disconnecting_mid_session_leaks_no_slot(client):
+    import streaming_api_omnivoice as api
+
+    with connect(client) as socket:
+        socket.send_json({"type": "text", "text": "job-1."})
+        socket.receive()  # first audio frame, then walk away
+    assert api.service.admission.active == 0

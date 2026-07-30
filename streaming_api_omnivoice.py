@@ -7,7 +7,7 @@ from typing import Generator
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Response, WebSocket
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -21,6 +21,7 @@ from admission import AdmissionControl
 from audio_formats import SUPPORTED_FORMATS, AudioEncoder, create_encoder
 from batch_scheduler import BatchScheduler, GenerationJob
 from voices import VOICE_METADATA
+from ws_session import SessionConfig, WebSocketSpeechSession
 
 BASE_DIR = Path(__file__).resolve().parent
 PLAYER_PATH = BASE_DIR / "streaming_player.html"
@@ -542,6 +543,93 @@ def create_speech(request: SpeechRequest) -> Response:
         if exc.status_code in (400, 404):
             return _openai_error(400, str(exc.detail), param="voice")
         return _openai_error(exc.status_code, str(exc.detail), error_type="server_error")
+
+
+async def _ws_reject(
+    socket: WebSocket,
+    code: int,
+    message: str,
+    param: str | None = None,
+    error_type: str = "invalid_request_error",
+) -> None:
+    """Report a handshake failure in the OpenAI envelope, then close.
+
+    The socket is already accepted, so there is no status code left to send —
+    a structured frame plus a close code is the only way the client learns why.
+    """
+    await socket.send_json(
+        {"error": {"message": message, "type": error_type, "param": param, "code": None}}
+    )
+    await socket.close(code=code)
+
+
+@app.websocket("/v1/audio/speech/ws")
+async def speech_websocket(
+    socket: WebSocket,
+    voice: str = Query(default="vf_phuong", min_length=1),
+    response_format: str = Query(default="pcm"),
+) -> None:
+    """Stream text in, stream audio out, on one connection.
+
+    Not an OpenAI endpoint — OpenAI has no WebSocket TTS — so this protocol is
+    ours: JSON text frames in ({"type": "text"|"flush"|"done"}), binary audio
+    frames out, one {"type": "done"} at the end. The session closes itself once
+    the client has sent no text for OMNIVOICE_WS_IDLE_TIMEOUT_S.
+
+    `voice` and `response_format` are the only knobs. Chunk size, speed, and
+    diffusion steps come from SessionConfig's defaults, so a socket generates
+    with the same settings an HTTP request does.
+
+    A socket costs one AdmissionControl slot for its lifetime, the same pool
+    HTTP streams draw from, so the two together stay under MAX_STREAMS.
+    """
+    await socket.accept()
+
+    if response_format not in SUPPORTED_FORMATS:
+        await _ws_reject(
+            socket,
+            1008,
+            f"Unsupported response_format '{response_format}'. "
+            f"Supported formats: {', '.join(SUPPORTED_FORMATS)}",
+            param="response_format",
+        )
+        return
+
+    try:
+        encoder = create_encoder(response_format, service.scheduler.sampling_rate)
+    except RuntimeError as exc:
+        await _ws_reject(socket, 1011, str(exc), error_type="server_error")
+        return
+
+    try:
+        ref_audio_path, ref_text = service.get_voice_clone_config(voice)
+    except HTTPException as exc:
+        await _ws_reject(socket, 1008, str(exc.detail), param="voice")
+        return
+
+    # Taken last, so a rejected handshake can never leak one.
+    slot = service.admission.try_acquire()
+    if slot is None:
+        await _ws_reject(
+            socket,
+            1013,
+            "Too many concurrent streams; retry shortly",
+            error_type="server_error",
+        )
+        return
+
+    session = WebSocketSpeechSession(
+        socket=socket,
+        engine=service,
+        config=SessionConfig(voice=voice, response_format=response_format),
+        encoder=encoder,
+        ref_audio=str(ref_audio_path),
+        ref_text=ref_text,
+    )
+    try:
+        await session.run()
+    finally:
+        slot.release()
 
 
 @app.get("/api/stream-mp3")
