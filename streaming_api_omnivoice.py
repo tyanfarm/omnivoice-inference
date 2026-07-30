@@ -201,7 +201,7 @@ class OmniVoiceStreamingService:
 
         return voice_path, ref_text
 
-    def _split_text_for_streaming(
+    def split_text_for_streaming(
         self,
         text: str,
         max_chars: int | None = None,
@@ -294,7 +294,7 @@ class OmniVoiceStreamingService:
         return chunk_np
 
     @staticmethod
-    def _audio_chunk_is_empty(audio: torch.Tensor | np.ndarray | None) -> bool:
+    def audio_chunk_is_empty(audio: torch.Tensor | np.ndarray | None) -> bool:
         if audio is None:
             return True
         if isinstance(audio, torch.Tensor):
@@ -302,10 +302,23 @@ class OmniVoiceStreamingService:
         return np.asarray(audio).size == 0
 
     @classmethod
-    def _audio_tensor_to_int16_bytes(cls, audio: torch.Tensor | np.ndarray) -> bytes:
+    def audio_to_int16_bytes(cls, audio: torch.Tensor | np.ndarray) -> bytes:
         chunk_np = cls._audio_to_numpy(audio)
         audio_int16 = (np.clip(chunk_np, -1.0, 1.0) * 32767).astype(np.int16)
         return audio_int16.tobytes()
+
+    @staticmethod
+    def chunk_speed(text: str, requested: float | None) -> float:
+        """Playback speed for one chunk.
+
+        Very short chunks are read at full speed; slowing a three-word phrase
+        makes it sound broken. Public so the WebSocket session speaks text at
+        the same rate the HTTP path does.
+        """
+        speed = requested if requested is not None else 0.8
+        if len(text.split()) <= 4:
+            return 1.0
+        return speed
 
     def text_to_speech_stream(
         self,
@@ -328,15 +341,13 @@ class OmniVoiceStreamingService:
 
             ref_audio_path, ref_text = self.get_voice_clone_config(request.voice_id)
 
-            speed = request.speed if request.speed is not None else 0.8
-            if len(text.split()) <= 4:
-                speed = 1.0
+            speed = self.chunk_speed(text, request.speed)
 
             leading = encoder.begin()
             if leading:
                 yield leading
 
-            for text_chunk in self._split_text_for_streaming(
+            for text_chunk in self.split_text_for_streaming(
                 text,
                 max_chars=request.chunk_chars,
             ):
@@ -354,12 +365,10 @@ class OmniVoiceStreamingService:
                 audio_chunk = pending.result()
                 pending = None
 
-                if self._audio_chunk_is_empty(audio_chunk):
+                if self.audio_chunk_is_empty(audio_chunk):
                     continue
 
-                encoded = encoder.encode(
-                    self._audio_tensor_to_int16_bytes(audio_chunk)
-                )
+                encoded = encoder.encode(self.audio_to_int16_bytes(audio_chunk))
                 if encoded:
                     yield encoded
 
