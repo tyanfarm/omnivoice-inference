@@ -111,6 +111,32 @@ asyncio.run(speak())
 `requirements.txt` is what makes the handshake work. Without it the upgrade is
 refused.
 
+### Trying it
+
+`ws_client.py` streams text a word at a time against a running server, so the
+incremental sentence cutting and the idle timeout get exercised rather than
+bypassed by one big message. It writes a playable file whichever format the
+transport used.
+
+```sh
+# normal session: streams words, sends done, writes a WAV
+python ws_client.py "Hello there. This is a streaming test." --voice af_heart --out out.wav
+
+# let the 5s idle timeout close the session instead of sending done
+python ws_client.py "No done message." --no-done
+
+# raw PCM over the wire, header added locally so the file still plays
+python ws_client.py "Testing." --format pcm --out out.wav
+```
+
+It prints first-frame latency and a line per audio frame, which is the quickest
+way to see whether audio starts before the whole utterance is generated. Exit
+status is 1 when the server reports an error, so it works in a script.
+
+Automated coverage lives in `tests/test_ws_speech.py` (no GPU — the model is
+stubbed, so `pytest` runs it by default) and `tests/test_ws_integration.py`
+(real model, `pytest -m gpu`).
+
 ## Note: vLLM-Omni cannot serve OmniVoice concurrently
 
 Investigated 2026-07-29 and rejected. Recording it here so nobody repeats it.
