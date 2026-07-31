@@ -34,7 +34,7 @@ from batch_scheduler import GenerationJob
 
 logger = logging.getLogger(__name__)
 
-WS_IDLE_TIMEOUT_S = float(os.environ.get("OMNIVOICE_WS_IDLE_TIMEOUT_S", "5.0"))
+WS_IDLE_TIMEOUT_S = float(os.environ.get("OMNIVOICE_WS_IDLE_TIMEOUT_S", "60.0"))
 WS_MAX_SESSION_S = float(os.environ.get("OMNIVOICE_WS_MAX_SESSION_S", "300.0"))
 # Sentences allowed to wait between the reader and the speaker. Full means the
 # reader stops pulling from the socket, which is TCP backpressure for free.
