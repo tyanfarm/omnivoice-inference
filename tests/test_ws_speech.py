@@ -290,3 +290,60 @@ def test_the_hard_ceiling_ends_a_session_that_never_stops(client, monkeypatch):
     assert final["type"] == "done"
     assert elapsed < 3.0, f"ceiling did not end the session; waited {elapsed:.1f}s"
     assert api.service.admission.active == 0
+
+
+def test_a_disconnect_cancels_the_job_the_session_had_submitted(client, monkeypatch):
+    # On a busy server the session's job sits in the scheduler FIFO behind
+    # other work. If the client vanishes, that job must be marked cancelled so
+    # the worker drops it instead of generating audio for a closed socket.
+    import batch_scheduler
+
+    cancelled: list[str] = []
+    original = batch_scheduler.GenerationJob.cancel
+
+    def spy(self):
+        cancelled.append(self.text)
+        return original(self)
+
+    monkeypatch.setattr(batch_scheduler.GenerationJob, "cancel", spy)
+
+    # Generation has to outlast the disconnect, or the job completes before
+    # there is anything left to cancel.
+    slow = client.fake_model.generate
+
+    def slow_generate(text, **kwargs):
+        time.sleep(0.8)
+        return slow(text, **kwargs)
+
+    monkeypatch.setattr(client.fake_model, "generate", slow_generate)
+
+    with connect(client) as socket:
+        socket.send_json({"type": "text", "text": "job-1 is a whole sentence."})
+        time.sleep(0.2)  # let the reader submit it, then walk away mid-generation
+
+    assert cancelled, "disconnect left the submitted job uncancelled"
+    assert any("job-1" in text for text in cancelled), cancelled
+
+
+def test_a_normal_finish_cancels_nothing(client, monkeypatch):
+    # The counterpart: a session that completes must not cancel the job it
+    # already collected, or the fix would be firing on the wrong path.
+    import batch_scheduler
+
+    cancelled: list[str] = []
+    original = batch_scheduler.GenerationJob.cancel
+
+    def spy(self):
+        cancelled.append(self.text)
+        return original(self)
+
+    monkeypatch.setattr(batch_scheduler.GenerationJob, "cancel", spy)
+
+    with connect(client) as socket:
+        socket.send_json({"type": "text", "text": "job-1."})
+        socket.send_json({"type": "done"})
+        frames, final = audio_frames(socket)
+
+    assert final["type"] == "done"
+    assert frames
+    assert cancelled == [], f"a completed session cancelled a job: {cancelled}"

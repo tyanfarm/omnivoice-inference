@@ -326,10 +326,14 @@ class WebSocketSpeechSession:
         )
         self._pending = job
         self._engine.scheduler.submit(job)
-        try:
-            audio = await await_job(job)
-        finally:
-            self._pending = None
+        # Cleared only after the audio is in hand, exactly as the HTTP path in
+        # text_to_speech_stream does it. Clearing in a `finally` would also run
+        # while unwinding a cancellation, and because an inner `finally` runs
+        # before an outer one, run()'s `finally` would then find _pending
+        # already None and never cancel the job — leaving it to generate for a
+        # socket that closed.
+        audio = await await_job(job)
+        self._pending = None
 
         if self._engine.audio_chunk_is_empty(audio):
             return
