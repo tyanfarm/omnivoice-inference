@@ -8,6 +8,16 @@ numpy==2.2.6
 # [standard], so without this the handshake fails.
 websockets==16.1.1
 
+# Turn detection (/v1/turn/predict): smart-turn-v3's published checkpoint is
+# ONNX-only. Runs via onnxruntime-gpu (CUDAExecutionProvider) -- the same
+# runtime smart-turn's own inference.py uses -- sharing the GPU alongside
+# torch/OmniVoice. transformers/huggingface_hub are already pulled in
+# transitively by omnivoice, but are pinned explicitly here since
+# turn_detection.py imports them directly.
+onnxruntime-gpu==1.23.2
+transformers==5.9.0
+huggingface_hub==1.16.4
+
 ## Install pytorch with your CUDA version, e.g.
 # pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
 

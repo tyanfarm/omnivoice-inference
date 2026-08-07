@@ -74,6 +74,9 @@ def client():
     assert api.service.scheduler.wait_ready(timeout=5)
     api.service.admission = AdmissionControl(max_streams=1)
 
+    api.turn_service._session = object()
+    api.turn_service.predict = lambda audio: {"prediction": 1, "probability": 0.91}
+
     with TestClient(api.app) as test_client:
         test_client.fake_model = fake
         test_client.voices_dir = api.VOICES_DIR

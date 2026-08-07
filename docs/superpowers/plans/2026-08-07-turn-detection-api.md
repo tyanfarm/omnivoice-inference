@@ -2,6 +2,21 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Implementation note (post-execution):** During execution the inference
+> approach changed from what this plan specifies: instead of converting the
+> ONNX graph to a `torch.nn.Module` via `onnx2torch` (Tasks 1–3 below), the
+> shipped code runs the checkpoint through `onnxruntime-gpu` directly — the
+> same runtime smart-turn's own `inference.py` uses — which needed no graph
+> patching and measured faster. Additionally, the audio-decode helpers and
+> the `TurnDetectionService`/`turn_service` singleton described under Task 5
+> as living in `streaming_api_omnivoice.py` were placed in `turn_detection.py`
+> instead, so the API module holds only route definitions. The steps below
+> are kept for their test-design and task-decomposition value; for what was
+> actually built, see the (updated) design doc at
+> `docs/superpowers/specs/2026-08-07-turn-detection-api-design.md` and the
+> code itself (`turn_detection.py`, `streaming_api_omnivoice.py`,
+> `tests/test_turn_detection.py`, `tests/test_turn_endpoint.py`).
+
 **Goal:** Add `POST /v1/turn/predict` to `streaming_api_omnivoice.py`, backed by smart-turn-v3 running as torch-native inference (via an onnx2torch conversion of the official ONNX checkpoint), so a client can upload an audio clip of a user's current speaking turn and get back whether it's semantically complete.
 
 **Architecture:** A new `turn_detection.py` module owns the model: it downloads `pipecat-ai/smart-turn-v3`'s `smart-turn-v3.2-gpu.onnx`, patches one unsupported node attribute, converts it to a `torch.nn.Module` with `onnx2torch`, and exposes a `TurnDetectionService` with the same `warmup()`/state-holding shape as the existing `OmniVoiceStreamingService`. `streaming_api_omnivoice.py` gains audio-decode helpers (multipart upload → mono 16kHz numpy via `torchaudio`) and the endpoint itself, wired into the existing startup/health machinery.

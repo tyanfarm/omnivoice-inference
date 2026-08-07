@@ -7,7 +7,7 @@ from typing import Generator
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException, Query, Response, WebSocket
+from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile, WebSocket
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from admission import AdmissionControl
 from audio_formats import SUPPORTED_FORMATS, AudioEncoder, create_encoder
 from batch_scheduler import BatchScheduler, GenerationJob
+from turn_detection import decode_audio_upload, turn_service
 from voices import VOICE_METADATA
 from ws_session import SessionConfig, WebSocketSpeechSession
 
@@ -35,6 +36,7 @@ WARMUP_REF_TEXT = (
     "This was the mission to go back to the moon, with the goal of "
     "eventually establishing a moon colony."
 )
+MAX_TURN_UPLOAD_BYTES = 25 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +393,7 @@ service = OmniVoiceStreamingService()
 @app.on_event("startup")
 def warmup_model() -> None:
     service.warmup()
+    turn_service.warmup()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -405,6 +408,7 @@ def health() -> dict[str, object]:
     return {
         "status": "ok",
         "model_loaded": service.scheduler.sampling_rate > 0,
+        "turn_model_loaded": turn_service.is_ready,
         "cuda_available": torch.cuda.is_available(),
     }
 
@@ -656,3 +660,22 @@ def stream_mp3_audio_get(
         chunk_chars=chunk_chars,
     )
     return stream_mp3_audio(request)
+
+
+@app.post("/v1/turn/predict")
+def predict_turn(file: UploadFile = File(...)) -> dict:
+    data = file.file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="file must not be empty")
+    if len(data) > MAX_TURN_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"file exceeds the {MAX_TURN_UPLOAD_BYTES} byte limit",
+        )
+
+    try:
+        audio = decode_audio_upload(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return turn_service.predict(audio)

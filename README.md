@@ -179,6 +179,41 @@ Automated coverage lives in `tests/test_ws_speech.py` (no GPU — the model is
 stubbed, so `pytest` runs it by default) and `tests/test_ws_integration.py`
 (real model, `pytest -m gpu`).
 
+## Turn detection
+
+`POST /v1/turn/predict` answers one question: has the speaker finished
+their turn? It runs [smart-turn-v3](https://github.com/pipecat-ai/smart-turn)
+(Whisper-tiny encoder + classifier head) via `onnxruntime-gpu` — the same
+runtime and checkpoint smart-turn's own reference code uses — sharing the
+GPU alongside OmniVoice.
+
+```sh
+curl -X POST http://localhost:9000/v1/turn/predict \
+  --form 'file=@clip.mp3'
+```
+
+Send an audio file (any format `torchaudio`'s ffmpeg backend can decode —
+mp3, wav, m4a, ...) as multipart form-data in a `file` field, the same
+convention as OpenAI-style transcription endpoints. Up to the last 8
+seconds of audio is used; shorter clips are zero-padded at the start,
+longer ones are truncated to keep the most recent audio.
+
+Response:
+
+```json
+{"prediction": 1, "probability": 0.9231}
+```
+
+`prediction` is `1` when the turn is complete, `0` when it's not (i.e.
+`probability > 0.5`). A `400` is returned for an empty file, an oversized
+upload (>25MB), or audio that can't be decoded.
+
+Automated coverage: `tests/test_turn_detection.py` (decode helpers and
+`TurnDetectionService` logic, stubbed for the fast/no-GPU suite plus one
+`pytest -m gpu` test against the real downloaded model) and
+`tests/test_turn_endpoint.py` (HTTP-level behavior via the stubbed
+`client` fixture).
+
 ## Note: vLLM-Omni cannot serve OmniVoice concurrently
 
 Investigated 2026-07-29 and rejected. Recording it here so nobody repeats it.

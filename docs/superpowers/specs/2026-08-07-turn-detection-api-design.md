@@ -26,57 +26,69 @@ reimplementation documented in the upstream repo's `train.py`
 (`SmartTurnV3Model`), but the *published checkpoint* for v3 is ONNX-only —
 there is no safetensors/PyTorch checkpoint on the Hub for v3, unlike v2.
 
-## Torch-native inference: onnx2torch + a graph patch
+## Inference: onnxruntime-gpu, the same runtime upstream ships
+
+Earlier iterations of this design (see git history) tried a torch-native
+route: convert the ONNX graph to a `torch.nn.Module` with `onnx2torch` so
+inference never leaves torch. That conversion worked (verified to ~1e-7
+parity with ONNX Runtime after patching one unsupported `Reshape` attribute)
+but traded a real, if small, risk — a hand-patched graph, and a conversion
+library whose op coverage isn't guaranteed across upgrades — for a benefit
+that turned out not to matter in practice: upstream's own `inference.py`
+already runs this exact checkpoint via `onnxruntime-gpu` with
+`CUDAExecutionProvider`, and that path is faster (~3.4ms/inference measured
+here vs ~18ms for the onnx2torch route) with zero patching. Given
+`onnxruntime-gpu` shares the GPU via CUDA the same way torch does — a
+separate CUDA context, but the same device — the extra runtime was judged
+worth it for matching upstream exactly. The design now uses that path.
 
 Loading path (runs once at service startup, mirrors
 `OmniVoiceStreamingService._load_model`):
 
 1. Download `smart-turn-v3.2-gpu.onnx` from the HF Hub (cached locally after
-   first run).
-2. Patch the graph in memory: 16 `Reshape` nodes in this export carry
-   `allowzero=1`, which the installed `onnx2torch` (1.5.15) does not
-   support (`NotImplementedError`). Flip the attribute to `0` on those
-   nodes. This is safe here — verified against the actual graph that none
-   of their target shapes are ever literally `0` (they're attention-head
-   reshapes with fixed positive dims for this fixed 8s/16kHz input) — so
-   `allowzero=0` and `allowzero=1` are behaviorally identical for this
-   model.
-3. `onnx2torch.convert(...)` the patched graph into a `torch.nn.Module`,
-   `.eval()`, move to `cuda:0` (or CPU if no GPU).
+   first run) via `huggingface_hub.hf_hub_download`.
+2. Build an `onnxruntime.InferenceSession` over it, with
+   `providers=["CUDAExecutionProvider", "CPUExecutionProvider"]` when
+   `torch.cuda.is_available()` (torch is only consulted here for the device
+   check — OmniVoice already depends on it), else CPU-only.
 
-Verified: the converted torch module's output matches ONNX Runtime's output
-on the original (unpatched) graph to ~1e-7 absolute difference across
-multiple random inputs, and both CPU and GPU execution paths work. GPU
-inference measured at ~18ms, consistent with upstream's published benchmarks.
+Verified: `session.get_providers()` confirms `CUDAExecutionProvider` is
+actually selected (not silently falling back to CPU) in this venv, and a
+real end-to-end request against a running server returns a sane probability
+in well under 100ms.
 
-No onnxruntime dependency is needed at serving time — only `onnx` (to load
-and patch the graph) and `onnx2torch` (to build the torch module).
-`onnxruntime` is added as a dev/test-only dependency, used exclusively by a
-regression test that re-checks the patched conversion still matches ONNX
-Runtime's reference output (guards against a future onnx2torch/onnx upgrade
-silently breaking the patch).
+`onnxruntime-gpu` is a runtime dependency (not dev/test-only, unlike the
+earlier onnx2torch draft) — it's the actual inference engine now. No `onnx`
+package or graph patching is needed.
 
-## New module: `turn_detection.py`
+## `turn_detection.py`
 
-Mirrors the existing `OmniVoiceStreamingService` pattern:
+Owns everything about turn detection — model loading, audio decoding, and
+the service singleton — so `streaming_api_omnivoice.py` stays limited to
+route definitions:
 
-- `_patch_reshape_allowzero(onnx_model) -> onnx.ModelProto` — the graph
-  patch described above.
-- `_load_torch_model(onnx_path, device) -> torch.nn.Module` — download,
-  patch, convert, move to device, eval mode.
+- `_load_onnx_session() -> onnxruntime.InferenceSession` — download, pick
+  providers, build the session.
 - `_truncate_audio_to_last_n_seconds(audio, n_seconds=8) -> np.ndarray` —
   vendored (BSD-2-Clause, credited in a comment) from smart-turn's
   `audio_utils.py`: keeps the *end* of the clip and pads at the *start* if
   shorter, matching upstream's own preprocessing (most recent audio is the
   most relevant to a turn-completion decision).
+- `_downmix_to_mono`, `_resample_if_needed`, `decode_audio_upload(data: bytes) -> np.ndarray`
+  — the audio-decode pipeline described below (moved here from the API
+  module so the API module has no audio-processing logic of its own).
 - `TurnDetectionService`:
   - `warmup()` — loads the model, called from FastAPI's startup event like
     `service.warmup()` today.
-  - `predict(audio: np.ndarray) -> dict` — truncate/pad → 
-    `WhisperFeatureExtractor` → forward pass → 
+  - `is_ready: bool` — property, used by `/health`.
+  - `predict(audio: np.ndarray) -> dict` — truncate/pad →
+    `WhisperFeatureExtractor` → `session.run(...)` →
     `{"prediction": 0 | 1, "probability": float}` (sigmoid is already
     applied inside the graph, so no extra activation step is needed;
     `prediction = 1 if probability > 0.5 else 0`).
+- `turn_service = TurnDetectionService()` — the module-level singleton,
+  constructed here (not in the API module) and imported by
+  `streaming_api_omnivoice.py`.
 
 ## Audio input
 
@@ -88,7 +100,8 @@ understands (mp3, wav, m4a, ...) is accepted.
 
 Decoding uses `torchaudio.load` (already installed and used elsewhere in
 this repo — confirmed it decodes this repo's own `.mp3` voice samples via
-its ffmpeg backend, so no new dependency is needed for decoding):
+its ffmpeg backend, so no new dependency is needed for decoding). All of
+this lives in `turn_detection.decode_audio_upload`, not the API module:
 
 1. `torchaudio.load(BytesIO(upload_bytes))` → `(channels, samples)` float32
    tensor + sample rate.
@@ -118,40 +131,52 @@ pass-through of upstream's semantics.
 
 ## Wiring
 
-- `turn_service = TurnDetectionService()` at module scope in
-  `streaming_api_omnivoice.py` (cheap — no model load in `__init__`).
+- `turn_service = TurnDetectionService()` is a module-level singleton in
+  `turn_detection.py` itself (cheap — no model load in `__init__`), and
+  `streaming_api_omnivoice.py` imports it (`from turn_detection import
+  decode_audio_upload, turn_service`) rather than constructing it. This
+  keeps the API module limited to route definitions, with no
+  audio-processing or model-loading logic of its own — everything turn-
+  detection-specific lives in `turn_detection.py`.
 - Model load happens in the existing `@app.on_event("startup")` handler,
   alongside `service.warmup()`.
-- `/health` gains a `turn_model_loaded` boolean next to the existing
-  `model_loaded`.
+- `/health` gains a `turn_model_loaded` boolean (`turn_service.is_ready`)
+  next to the existing `model_loaded`.
 - No admission control / batch scheduler for this endpoint: unlike
-  OmniVoice's diffusion generation, this is a single ~18ms forward pass, so
-  it runs directly in FastAPI's threadpool like the other synchronous `def`
-  routes. Revisit if concurrent load turns out to be heavy enough to
-  contend for GPU time with OmniVoice generation.
+  OmniVoice's diffusion generation, this is a single sub-10ms forward pass
+  on GPU, so it runs directly in FastAPI's threadpool like the other
+  synchronous `def` routes. Revisit if concurrent load turns out to be
+  heavy enough to contend for GPU time with OmniVoice generation.
 
 ## Dependencies (`requirements.txt`)
 
-- `onnx` — runtime, used to load/patch the ONNX graph at startup.
-- `onnx2torch` — runtime, converts the patched graph to a torch module.
-- `onnxruntime` — dev/test only (alongside the existing pytest comment
-  block), used by the conversion-parity regression test.
+- `onnxruntime-gpu` — runtime; this is the actual inference engine, not a
+  dev/test-only tool. Pinned to `1.23.2`, matching the version upstream's
+  own `requirements.txt` uses.
+- `transformers`, `huggingface_hub` — already present transitively via
+  `omnivoice`, pinned explicitly since `turn_detection.py` imports them
+  directly.
 
-`torch`/`torchaudio`/`transformers` are already present in this venv (per
-the README's manual install step and `omnivoice`'s own dependency chain
-respectively) — no changes needed there.
+`torch`/`torchaudio` are already present in this venv (per the README's
+manual install step) — no changes needed there. `torch` is still used, but
+only for `torch.cuda.is_available()` to pick onnxruntime's providers list;
+it does no inference work for this model.
 
 ## Testing
 
-New `tests/test_turn_detection.py`, following the existing test file
-conventions in `tests/`:
+`tests/test_turn_detection.py` (model/decode logic — mirrors where the code
+now lives) and `tests/test_turn_endpoint.py` (HTTP-level behavior of the
+route), following the existing test file conventions in `tests/`:
 
 - Audio decode helpers (mono downmix, resampling, last-N-seconds
   truncate/pad) — pure functions, no model needed.
-- Conversion parity: build the patched torch module and assert its output
-  matches an ONNX Runtime session on the same (unpatched) graph within a
-  tight tolerance, on a couple of fixed inputs — this is the regression
-  guard for the `allowzero` patch specifically.
-- `predict()` integration test against the real downloaded model, gated the
-  same way `test_streaming_integration.py` gates its real-model tests
-  (slow/optional).
+- `TurnDetectionService.predict()` logic against a stub `onnxruntime`-shaped
+  session object (records the fed input, returns a fixed probability) —
+  fast, no GPU/network.
+- A real end-to-end `predict()` test against the downloaded model, gated
+  the same way `test_streaming_integration.py` gates its real-model tests
+  (the `gpu` pytest marker, excluded by default).
+- HTTP-level endpoint tests (200 shape, empty file, undecodable audio,
+  oversized upload, `/health` field) via the shared `client` fixture, which
+  now also stubs `turn_service`'s session so app startup in tests never
+  downloads the real model.
