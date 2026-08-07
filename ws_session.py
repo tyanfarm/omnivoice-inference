@@ -331,7 +331,12 @@ class WebSocketSpeechSession:
         # while unwinding a cancellation, and because an inner `finally` runs
         # before an outer one, run()'s `finally` would then find _pending
         # already None and never cancel the job — leaving it to generate for a
-        # socket that closed.
+        # socket that closed. If await_job raises instead — a generation
+        # failure — this line is skipped too, so run()'s finally calls
+        # cancel() on a job that already delivered; harmless, since cancel()
+        # after a result is a no-op. On the JOB_TIMEOUT_S path that same
+        # cancel() is actively correct, since there the job genuinely is
+        # still queued.
         audio = await await_job(job)
         self._pending = None
 

@@ -29,8 +29,11 @@ class JobCancelled(Exception):
 class GenerationJob:
     """One text chunk awaiting generation.
 
-    Exactly one of set_result/set_exception is called by the worker thread;
-    the submitting thread blocks in result() until then.
+    cancel(), set_result(), and set_exception() are three possible writers to
+    the job's one-item result slot; whichever writes first wins and the other
+    writes are silently dropped. The submitting thread blocks in result()
+    until the slot is filled, then either returns audio or raises the
+    delivered exception — JobCancelled if cancel() won the race.
     """
 
     text: str
@@ -56,7 +59,10 @@ class GenerationJob:
     def cancel(self) -> None:
         """Mark the job dead and release anyone blocked in result().
 
-        Idempotent: a second call sees a full slot and drops its payload.
+        Idempotent: the flag is set unconditionally, and re-delivering is
+        harmless either way — a full slot drops the payload, an empty one
+        (already drained by a prior consumer) just delivers a JobCancelled
+        nobody will ever read.
         """
         self._cancelled.set()
         self._deliver((None, JobCancelled("generation cancelled")))
@@ -67,7 +73,7 @@ class GenerationJob:
     def set_exception(self, exc: BaseException) -> None:
         self._deliver((None, exc))
 
-    def _deliver(self, payload: tuple) -> None:
+    def _deliver(self, payload: tuple[np.ndarray | None, BaseException | None]) -> None:
         """First writer wins; later writers are dropped.
 
         The slot holds one item, so a blocking put would wedge whichever side

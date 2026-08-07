@@ -325,6 +325,51 @@ def test_a_disconnect_cancels_the_job_the_session_had_submitted(client, monkeypa
     assert any("job-1" in text for text in cancelled), cancelled
 
 
+def test_a_disconnect_mid_generation_does_not_park_a_tts_thread_token(
+    client, monkeypatch
+):
+    # cancel() stops the job, but await_job's abandon_on_cancel is what frees
+    # the worker thread borrowed from TTS_THREAD_LIMITER; without it a
+    # disconnect would hold that token for the full JOB_TIMEOUT_S (120s), and
+    # sixteen such disconnects would exhaust the limiter and stall every other
+    # session on the server. This asserts the token itself is freed, which the
+    # "cancel was called" tests above do not.
+    import ws_session
+
+    generating = threading.Event()
+    slow = client.fake_model.generate
+
+    def slow_generate(text, **kwargs):
+        # Flags that a token is actually borrowed right now, so the later
+        # borrowed_tokens == 0 assertion isn't vacuously true.
+        generating.set()
+        time.sleep(0.8)
+        return slow(text, **kwargs)
+
+    monkeypatch.setattr(client.fake_model, "generate", slow_generate)
+
+    with connect(client) as socket:
+        socket.send_json({"type": "text", "text": "job-1 is a whole sentence."})
+        assert generating.wait(timeout=2), "generation never started"
+        assert ws_session.TTS_THREAD_LIMITER.borrowed_tokens > 0, (
+            "nothing was in flight at disconnect time; test proves nothing"
+        )
+        # socket closes here, mid-generation
+
+    # The abandoned thread only returns its token once slow_generate's sleep
+    # actually finishes, so give it a beat past the 0.8s past disconnect.
+    deadline = time.monotonic() + 2.0
+    while (
+        ws_session.TTS_THREAD_LIMITER.borrowed_tokens > 0
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.05)
+
+    assert ws_session.TTS_THREAD_LIMITER.borrowed_tokens == 0, (
+        "disconnect left a TTS worker thread token parked"
+    )
+
+
 def test_a_normal_finish_cancels_nothing(client, monkeypatch):
     # The counterpart: a session that completes must not cancel the job it
     # already collected, or the fix would be firing on the wrong path.
