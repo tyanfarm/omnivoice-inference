@@ -16,6 +16,15 @@ MAX_BATCH = int(os.environ.get("OMNIVOICE_MAX_BATCH", "4"))
 COLLECT_WINDOW_S = float(os.environ.get("OMNIVOICE_COLLECT_WINDOW_MS", "10")) / 1000.0
 
 
+class JobCancelled(Exception):
+    """Raised by GenerationJob.result() when the job was cancelled first.
+
+    The scheduler drops a cancelled job instead of generating it, so nobody
+    would otherwise fill its result slot and the caller would block for the
+    whole timeout holding a worker thread.
+    """
+
+
 @dataclass
 class GenerationJob:
     """One text chunk awaiting generation.
@@ -45,13 +54,32 @@ class GenerationJob:
         return self._cancelled.is_set()
 
     def cancel(self) -> None:
+        """Mark the job dead and release anyone blocked in result().
+
+        Idempotent: a second call sees a full slot and drops its payload.
+        """
         self._cancelled.set()
+        self._deliver((None, JobCancelled("generation cancelled")))
 
     def set_result(self, audio: np.ndarray) -> None:
-        self._slot.put((audio, None))
+        self._deliver((audio, None))
 
     def set_exception(self, exc: BaseException) -> None:
-        self._slot.put((None, exc))
+        self._deliver((None, exc))
+
+    def _deliver(self, payload: tuple) -> None:
+        """First writer wins; later writers are dropped.
+
+        The slot holds one item, so a blocking put would wedge whichever side
+        lost the race — and losing it on the worker thread would take the whole
+        scheduler down with it. Every write is therefore non-blocking, and both
+        outcomes are correct: the caller gets real audio if generation won, and
+        JobCancelled if the cancel did.
+        """
+        try:
+            self._slot.put_nowait(payload)
+        except queue.Full:
+            pass
 
     def result(self, timeout: float | None = None) -> np.ndarray:
         audio, exc = self._slot.get(timeout=timeout)

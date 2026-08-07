@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
-from batch_scheduler import BatchScheduler, GenerationJob
+from batch_scheduler import BatchScheduler, GenerationJob, JobCancelled
 
 
 def make_job(text="job-0", num_step=16, denoise=False, postprocess_output=False):
@@ -171,3 +174,61 @@ def test_worker_survives_a_failure_and_serves_the_next_job(scheduler, fake_model
     good = make_job(text="job-5")
     scheduler.submit(good)
     assert good.result(timeout=10).tolist() == [5.0] * 4
+
+
+def test_cancel_releases_a_caller_already_blocked_in_result():
+    # The scheduler skips a cancelled job, so nothing will ever fill its slot.
+    # Without cancel() writing one, this waiter would block for its whole
+    # timeout while holding a worker thread from the TTS limiter.
+    job = make_job()
+    threading.Timer(0.1, job.cancel).start()
+
+    started = time.monotonic()
+    with pytest.raises(JobCancelled):
+        job.result(timeout=5)
+    assert time.monotonic() - started < 1.0, "cancel did not release the waiter"
+
+
+def test_cancel_after_a_result_leaves_the_result_intact():
+    # A cancel that loses the race must not overwrite real audio with an error.
+    job = make_job()
+    job.set_result(np.full(4, 7.0, dtype=np.float32))
+    job.cancel()
+    assert job.result(timeout=1).tolist() == [7.0] * 4
+
+
+def test_the_worker_never_blocks_when_cancel_filled_the_slot_first():
+    # queue.Queue(maxsize=1).put() blocks when full. If set_result still used
+    # it, a cancel winning this race would wedge the scheduler's single worker
+    # thread forever and every later request would hang.
+    job = make_job()
+    job.cancel()
+
+    finished = threading.Event()
+    threading.Thread(
+        target=lambda: (
+            job.set_result(np.full(4, 1.0, dtype=np.float32)),
+            finished.set(),
+        ),
+        daemon=True,
+    ).start()
+    assert finished.wait(timeout=2.0), "set_result blocked on a full slot"
+
+
+def test_cancel_is_idempotent():
+    job = make_job()
+    job.cancel()
+    job.cancel()
+    assert job.cancelled is True
+
+
+def test_a_cancelled_job_still_reports_itself_cancelled(scheduler, fake_model):
+    # The flag the worker checks must survive the new slot write.
+    job = make_job(text="job-9")
+    job.cancel()
+    scheduler.submit(job)
+    live = make_job(text="job-1")
+    scheduler.submit(live)
+    assert live.result(timeout=10).tolist() == [1.0] * 4
+    assert job.cancelled is True
+    assert all("job-9" not in c["text"] for c in fake_model.calls)
