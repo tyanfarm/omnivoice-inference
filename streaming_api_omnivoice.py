@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import secrets
 from pathlib import Path
 from typing import Generator
 
 import numpy as np
 import torch
-from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile, WebSocket
+from dotenv import load_dotenv
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    WebSocket,
+)
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -15,6 +28,10 @@ from fastapi.responses import (
 )
 from omnivoice import OmniVoice
 from pydantic import BaseModel, Field
+
+# Loaded before the local modules below, which read OMNIVOICE_* settings at
+# import time. Variables already set in the environment win over .env.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from admission import AdmissionControl
 from audio_formats import SUPPORTED_FORMATS, AudioEncoder, create_encoder
@@ -35,6 +52,8 @@ WARMUP_REF_TEXT = (
     "eventually establishing a moon colony."
 )
 MAX_TURN_UPLOAD_BYTES = 25 * 1024 * 1024
+# Every endpoint but /health requires this in the x-api-key header.
+API_KEY = os.environ.get("X_API_KEY", "")
 
 logger = logging.getLogger(__name__)
 
@@ -388,8 +407,22 @@ class OmniVoiceStreamingService:
 service = OmniVoiceStreamingService()
 
 
+def _api_key_matches(provided: str | None) -> bool:
+    return provided is not None and secrets.compare_digest(
+        provided.encode("utf-8"), API_KEY.encode("utf-8")
+    )
+
+
+def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    if not _api_key_matches(x_api_key):
+        raise HTTPException(status_code=401, detail="Missing or invalid x-api-key header")
+
+
 @app.on_event("startup")
 def warmup_model() -> None:
+    # Fail closed: an unset key would otherwise leave every endpoint open.
+    if not API_KEY:
+        raise RuntimeError("X_API_KEY is not set; add it to .env or the environment")
     service.warmup()
     turn_service.warmup()
 
@@ -404,7 +437,7 @@ def health() -> dict[str, object]:
     }
 
 
-@app.get("/api/voices")
+@app.get("/api/voices", dependencies=[Depends(require_api_key)])
 def list_voices(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),
@@ -412,12 +445,12 @@ def list_voices(
     return service.list_voices_paginated(page=page, page_size=page_size)
 
 
-@app.get("/api/voices/{voice_id}")
+@app.get("/api/voices/{voice_id}", dependencies=[Depends(require_api_key)])
 def get_voice(voice_id: str) -> dict[str, str | None]:
     return service.get_voice(voice_id)
 
 
-@app.get("/api/voices/{voice_id}/audio")
+@app.get("/api/voices/{voice_id}/audio", dependencies=[Depends(require_api_key)])
 def get_voice_audio(voice_id: str) -> FileResponse:
     voice_path = service.get_voice_audio_path(voice_id)
     return FileResponse(voice_path, media_type="audio/mpeg", filename=voice_path.name)
@@ -473,7 +506,7 @@ def _start_audio_stream(
     )
 
 
-@app.post("/api/stream-mp3")
+@app.post("/api/stream-mp3", dependencies=[Depends(require_api_key)])
 def stream_mp3_audio(request: StreamRequest) -> StreamingResponse:
     return _start_audio_stream(request, "omnivoice-stream")
 
@@ -500,7 +533,7 @@ def _openai_error(
     )
 
 
-@app.post("/v1/audio/speech")
+@app.post("/v1/audio/speech", dependencies=[Depends(require_api_key)])
 def create_speech(request: SpeechRequest) -> Response:
     """OpenAI-compatible text-to-speech.
 
@@ -577,7 +610,20 @@ async def speech_websocket(
 
     A socket costs one AdmissionControl slot for its lifetime, the same pool
     HTTP streams draw from, so the two together stay under MAX_STREAMS.
+
+    A missing or wrong x-api-key is refused before the upgrade, as a plain
+    HTTP 401, so an unauthenticated client never holds an open socket.
     """
+    if not _api_key_matches(socket.headers.get("x-api-key")):
+        await socket.send_denial_response(
+            _openai_error(
+                401,
+                "Missing or invalid x-api-key header",
+                error_type="authentication_error",
+            )
+        )
+        return
+
     await socket.accept()
 
     if response_format not in SUPPORTED_FORMATS:
@@ -627,7 +673,7 @@ async def speech_websocket(
         slot.release()
 
 
-@app.get("/api/stream-mp3")
+@app.get("/api/stream-mp3", dependencies=[Depends(require_api_key)])
 def stream_mp3_audio_get(
     text: str = Query(..., min_length=1),
     voice_id: str = Query(default="af_heart", min_length=1),
@@ -653,7 +699,7 @@ def stream_mp3_audio_get(
     return stream_mp3_audio(request)
 
 
-@app.post("/v1/turn/predict")
+@app.post("/v1/turn/predict", dependencies=[Depends(require_api_key)])
 def predict_turn(file: UploadFile = File(...)) -> dict:
     data = file.file.read()
     if not data:

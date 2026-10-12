@@ -13,10 +13,31 @@ uv pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url http
 
 uv pip install omnivoice
 
-uv pip install "lameenc==1.8.2" "websockets==16.1.1"
+uv pip install "lameenc==1.8.2" "websockets==16.1.1" "python-dotenv==1.2.4"
+
+# The server refuses to start without an API key
+cp .env.example .env   # then set X_API_KEY
 
 uvicorn streaming_api_omnivoice:app --host 0.0.0.0 --port 9000
 ```
+
+## Authentication
+
+Every endpoint except `GET /health` requires an `x-api-key` header matching
+`X_API_KEY`, read from `.env` next to `streaming_api_omnivoice.py` (a variable
+already set in the environment wins). A missing or wrong key is a `401`. The
+WebSocket gets that same `401` in place of the upgrade, so the connection is
+never opened.
+The server will not start with `X_API_KEY` unset, so it cannot come up open by
+accident.
+
+```sh
+curl http://localhost:9000/api/voices -H "x-api-key: $X_API_KEY"
+```
+
+The OpenAI SDK sends its key as `Authorization: Bearer`, which is ignored here.
+Pass the header explicitly instead, e.g.
+`OpenAI(base_url=..., api_key="unused", default_headers={"x-api-key": key})`.
 
 ## OpenAI-compatible endpoint
 
@@ -25,6 +46,7 @@ engine, admission control, and batching as `/api/stream-mp3`.
 
 ```sh
 curl -X POST http://localhost:9000/v1/audio/speech \
+  -H "x-api-key: $X_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"input":"Hello there.","voice":"af_heart"}' \
   --output speech.mp3
@@ -47,7 +69,8 @@ Three fields:
 Everything else — speed, chunking, diffusion steps — uses the same defaults as
 `/api/stream-mp3`. Extra fields a stock OpenAI client sends (`model`, `speed`,
 `instructions`) are ignored rather than rejected, so those clients still work.
-No `Authorization` header is required; one sent is ignored.
+An `Authorization` header is ignored; the key goes in `x-api-key` (see
+[Authentication](#authentication)).
 
 Errors use OpenAI's envelope:
 
@@ -133,11 +156,12 @@ oversubscribe the GPU. A session speaks its sentences one at a time, so it can
 never have more than one job queued.
 
 ```python
-import asyncio, json, websockets
+import asyncio, json, os, websockets
 
 async def speak():
     url = "ws://localhost:9000/v1/audio/speech/ws?voice=af_heart&response_format=pcm"
-    async with websockets.connect(url) as ws:
+    headers = {"x-api-key": os.environ["X_API_KEY"]}
+    async with websockets.connect(url, additional_headers=headers) as ws:
         await ws.send(json.dumps({"type": "text", "text": "Hello there."}))
         await ws.send(json.dumps({"type": "done"}))
         async for frame in ws:
@@ -158,7 +182,8 @@ refused.
 `ws_client.py` streams text a word at a time against a running server, so the
 incremental sentence cutting and the idle timeout get exercised rather than
 bypassed by one big message. It writes a playable file whichever format the
-transport used.
+transport used. It sends `X_API_KEY` from the environment or `.env` as
+`x-api-key`; `--api-key` overrides it.
 
 ```sh
 # normal session: streams words, sends done, writes a WAV
@@ -189,6 +214,7 @@ GPU alongside OmniVoice.
 
 ```sh
 curl -X POST http://localhost:9000/v1/turn/predict \
+  -H "x-api-key: $X_API_KEY" \
   --form 'file=@clip.mp3'
 ```
 

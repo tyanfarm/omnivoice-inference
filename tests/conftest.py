@@ -5,6 +5,8 @@ import re
 import numpy as np
 import pytest
 
+TEST_API_KEY = "test-api-key"
+
 
 class FakeOmniVoice:
     """Stand-in for OmniVoice that records how it was called.
@@ -77,7 +79,9 @@ def client():
     api.turn_service._session = object()
     api.turn_service.predict = lambda audio: {"prediction": 1, "probability": 0.91}
 
-    with TestClient(api.app) as test_client:
+    api.API_KEY = TEST_API_KEY
+
+    with TestClient(api.app, headers={"x-api-key": TEST_API_KEY}) as test_client:
         test_client.fake_model = fake
         test_client.voices_dir = api.VOICES_DIR
         yield test_client

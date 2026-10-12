@@ -15,7 +15,7 @@ def live_client():
 
     import streaming_api_omnivoice as api
 
-    with TestClient(api.app) as client:
+    with TestClient(api.app, headers={"x-api-key": api.API_KEY}) as client:
         yield client
 
 

@@ -16,15 +16,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 import websockets
+from dotenv import load_dotenv
 
 from audio_formats import WAV_HEADER_SIZE, wav_header
 
 SAMPLE_RATE = 24000
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("text", nargs="?", help="text to speak")
     parser.add_argument("--file", type=Path, help="read the text from a file instead")
     parser.add_argument("--url", default="ws://127.0.0.1:9000")
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("X_API_KEY"),
+        help="sent as x-api-key; defaults to X_API_KEY from the environment or .env",
+    )
     parser.add_argument("--voice", default="vf_phuong")
     parser.add_argument(
         "--format", default="pcm", choices=("pcm", "wav", "mp3"), dest="response_format"
@@ -85,7 +94,14 @@ async def run(args: argparse.Namespace) -> int:
     started = time.monotonic()
     first_frame: float | None = None
 
-    socket = await websockets.connect(url)
+    headers = {"x-api-key": args.api_key} if args.api_key else {}
+    try:
+        socket = await websockets.connect(url, additional_headers=headers)
+    except websockets.exceptions.InvalidStatus as exc:
+        # Refused before the upgrade, e.g. a 401 for a missing or wrong key.
+        body = exc.response.body.decode("utf-8", "replace")
+        print(f"handshake refused: HTTP {exc.response.status_code} {body}", file=sys.stderr)
+        return 1
     writer = asyncio.create_task(feed(socket, text, args.delay, not args.no_done))
     try:
         async for frame in socket:

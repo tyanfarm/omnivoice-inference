@@ -4,6 +4,8 @@ uvicorn==0.44.0
 pydantic==2.12.5
 lameenc==1.8.2
 numpy==2.2.6
+# Loads X_API_KEY (and any OMNIVOICE_* settings) from .env.
+python-dotenv==1.2.4
 # WebSocket transport for /v1/audio/speech/ws. uvicorn is pinned without
 # [standard], so without this the handshake fails.
 websockets==16.1.1

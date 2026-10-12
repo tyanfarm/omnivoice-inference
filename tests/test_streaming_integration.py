@@ -17,7 +17,7 @@ TEXT = (
 def client():
     import streaming_api_omnivoice as api
 
-    with TestClient(api.app) as test_client:
+    with TestClient(api.app, headers={"x-api-key": api.API_KEY}) as test_client:
         yield test_client
 
 
