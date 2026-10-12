@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 
-@pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
+@pytest.mark.parametrize("path", ["/", "/docs", "/redoc", "/openapi.json"])
 def test_schema_and_docs_endpoints_are_not_served(client, path):
     # Disabling only openapi_url would 404 /docs as a side effect; asserting
     # all three means a later FastAPI upgrade cannot quietly re-expose one.

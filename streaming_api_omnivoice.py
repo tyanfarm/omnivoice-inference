@@ -10,7 +10,6 @@ import torch
 from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile, WebSocket
 from fastapi.responses import (
     FileResponse,
-    HTMLResponse,
     JSONResponse,
     StreamingResponse,
 )
@@ -25,7 +24,6 @@ from voices import VOICE_METADATA
 from ws_session import SessionConfig, WebSocketSpeechSession
 
 BASE_DIR = Path(__file__).resolve().parent
-PLAYER_PATH = BASE_DIR / "streaming_player.html"
 VOICES_DIR = BASE_DIR / "voices"
 MODEL_ID = "k2-fsa/OmniVoice"
 STREAM_TEXT_CHUNK_SIZE = 240
@@ -394,13 +392,6 @@ service = OmniVoiceStreamingService()
 def warmup_model() -> None:
     service.warmup()
     turn_service.warmup()
-
-
-@app.get("/", response_class=HTMLResponse)
-def index() -> HTMLResponse:
-    if not PLAYER_PATH.exists():
-        raise HTTPException(status_code=404, detail="streaming_player.html not found")
-    return HTMLResponse(PLAYER_PATH.read_text(encoding="utf-8"))
 
 
 @app.get("/health")

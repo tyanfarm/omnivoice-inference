@@ -184,10 +184,10 @@ With the server running:
 venv/bin/uvicorn streaming_api_omnivoice:app --host 0.0.0.0 --port 9000
 ```
 
-Open `http://localhost:9000/` in three or four browser tabs and start playback
-in each within a second or two. Before this change, tabs 2+ sit silent until
-tab 1 finishes. After it, all of them should begin producing audio at roughly
-the same time.
+Start three or four `/api/stream-mp3` requests within a second or two of each
+other (e.g. parallel `curl` calls). Before this change, requests 2+ sit silent
+until request 1 finishes. After it, all of them should begin producing audio at
+roughly the same time.
 
 ## Measured results
 
